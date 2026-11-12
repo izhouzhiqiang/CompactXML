@@ -1,0 +1,10 @@
+._论文撰写规范.pdf
+._*
+*.aux
+*.bbl
+*.blg
+*.lof
+*.log
+*.lot
+*.out
+*.toc

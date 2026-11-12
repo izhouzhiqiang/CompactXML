@@ -1,0 +1,103 @@
+% !TeX root = ../main.tex
+\chapter{基于压缩表示的查询处理方法}
+
+\section{查询模型与处理流程}
+
+设文档集合为 $D$，编码方法为 $C$。本文定义三类操作：
+\begin{description}[leftmargin=3.2cm,style=nextline]
+  \item[路径存在 $\operatorname{EXISTS}(D,p)$] 判断文档中是否存在完整路径 $p$，返回布尔值。
+  \item[精确内容 $\operatorname{CONTAINS}(D,t)$] 判断是否存在叶文本完整值与 $t$ 精确相等，返回布尔值；空字符串返回 false。
+  \item[路径取值 $\operatorname{GET}(D,p)$] 按文档顺序返回路径 $p$ 的首个叶文本；没有匹配路径时返回 NULL。
+\end{description}
+
+方法要求压缩表示上的查询结果与对解析语义执行相同操作的结果一致：
+\[
+Q(C(D),x)=Q_{\mathrm{ref}}(D,x),\qquad
+Q\in\{\operatorname{EXISTS},\operatorname{CONTAINS},\operatorname{GET}\}.
+\]
+该要求不是完整 XPath 等价。查询处理先将查询字符串映射为路径或 token 标识，再按操作类型访问排序路径索引、Bloom 元数据、内容流或 GIN，最后在可能存在哈希碰撞或近似命中时执行精确验证。各阶段复用编码时定义的标识规则，避免查询侧另造不一致的编码。
+
+\section{精确内容查询}
+
+对单文档 $\operatorname{CONTAINS}(D,t)$，方法按 token 长度选择查询标识。短 token 通过共享字典映射为 $\texttt{token\_id}$；若字典未命中，则该值不可能出现在采用同一字典的已编码短 token 记录中，可返回 false。长 token 计算内联哈希标识，但哈希只用于候选匹配，不能直接确认相等。
+
+短 token 的文档内判断过程为：读取 token ID 并检查文档级 Bloom Filter；若 Bloom 明确返回不存在，立即返回 false；若 Bloom 返回可能存在，则顺序解码内容流中的 token ID 并比较。只有内容记录中出现目标 ID 才返回 true。长 token 查询先以哈希缩小待核验范围，再查找内联区原文并逐字节比较。即使不同文档中的不同长 token 发生 32 位哈希碰撞，该检查也能避免错误命中；代价是候选文档仍需进入 recheck。
+
+设文档包含 $N$ 个内容对，Bloom 使用 $k$ 次探测，则一次短 token 判断的工作量取决于字典查找、Bloom 探测和是否进行内容扫描。Bloom 阴性路径可避免行内扫描，但阳性路径最坏仍须扫描内容流；因此不能将所有负例统一描述为严格 $O(1)$。对于无索引全表查询，数据库执行器仍需对扫描行调用谓词，即使查询 token 未进入共享字典，也不能据此称整表处理只需一次字典查找。
+
+\subsection{示例文档上的正例与负例}
+
+以第4章示例文档为例，短文本 \texttt{机械键盘} 的标识为 \texttt{token\_id=3}。执行内容查询 \texttt{CONTAINS(D, ``机械键盘'')} 时，查询字符串先映射为 3；若 Bloom Filter 返回阴性，则可以直接判定为 false；若返回阳性，则继续扫描内容流，在记录 $(6,3)$ 处完成 token 标识匹配并返回 true。这里的 true 仍然来自内容记录的精确匹配，而不是 Bloom Filter 单独给出的结论。
+
+查询 \texttt{CONTAINS(D, ``耳机'')} 是一个负例。若 \texttt{耳机} 未出现在共享 token 字典中，查询可以直接返回 false；若查询值已经进入字典但当前文档的 Bloom Filter 返回阴性，同样可以返回 false；若 Bloom 返回阳性，则仍需扫描全部候选内容记录，扫描结束后未发现目标 token 才能返回 false。由此可见，负例可能经过“字典未命中”“Bloom 确定不存在”或“精确扫描未匹配”三条路径，不能把所有负例都描述为相同的常数时间过程。
+
+\begin{table}[htbp]
+\centering
+\small
+\caption{示例 XML 上的内容查询正例与负例}
+\label{tab:query-example-content}
+\begin{tabular}{p{0.28\linewidth}p{0.16\linewidth}p{0.45\linewidth}}
+\toprule
+查询值 & 期望结果 & 主要处理过程 \\
+\midrule
+\texttt{机械键盘} & true & 字典得到 token ID 3；Bloom 通过后扫描内容流并精确匹配 $(6,3)$。 \\
+\texttt{耳机} & false & 字典未命中，或 Bloom 确定不存在，或扫描内容流后未发现精确匹配。 \\
+\texttt{1001} & true & 字典得到 token ID 1，在内容流首条记录 $(3,1)$ 中匹配。 \\
+\texttt{10} & false & 即使文本中包含字符 ``10''，也不满足本文定义的完整叶文本相等语义。 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+表~\ref{tab:query-example-content} 中的最后一个负例用于说明本文的查询语义：\texttt{CONTAINS} 判断叶节点完整文本值是否与查询字符串逐字节相等，不执行任意子串匹配。该语义使压缩表示、GIN 候选键和精确 recheck 可以采用同一判断标准。
+
+\section{路径存在性与值提取查询}
+
+对 $\operatorname{EXISTS}(D,p)$，查询字符串先在路径字典中查找 $\texttt{path\_id}$。若路径未进入字典，则文档不可能包含该路径，可返回 false；若命中，则在该文档按 $\texttt{path\_id}$ 升序排列的路径索引中二分查找。设文档不同路径数为 $P$，路径索引部分需要 $O(\log P)$ 次比较，不包括字典查找及数据库函数调用成本。
+
+对 $\operatorname{GET}(D,p)$，方法同样先映射路径 ID 并检查路径索引。若不存在则返回 NULL；若存在，则从文档序内容流开头扫描，找到首个 $\texttt{path\_id}$ 相同的记录，再将 token ID 反查为字符串。由于相同路径记录可能在内容流中不连续，当前格式没有可直接定位到全部匹配值的偏移量，因此值提取部分最坏需要扫描 $N$ 个内容对。该设计用保留文档序支持首值语义和结构恢复，代价是路径值提取仍需遍历。
+
+路径索引还可能包含 $\texttt{pair\_count}=0$ 的内部节点路径：此时 EXISTS 返回 true，因为元素路径确实存在；GET 则在内容流中找不到对应叶文本并返回 NULL。这一区分来自两个操作各自的语义，不应把 $\texttt{pair\_count}=0$ 误认为路径不存在。路径索引只解决路径是否出现，不应写成 GET 的常数时间索引。若未来增加路径到内容偏移的辅助结构，还需处理同路径值不连续、重复顺序和元数据增量，并通过空间与查询实验评价净效果。
+
+\subsection{示例文档上的路径查询}
+
+在第4章示例文档中，路径 \texttt{/orders/order/item/name} 对应 \texttt{path\_id=6}，因此
+\texttt{EXISTS(D, ``/orders/order/item/name'')} 先在路径字典中得到 6，再在排序路径索引中找到该条目，返回 true。相反，\texttt{EXISTS(D, ``/orders/order/price'')} 因路径字典未命中而返回 false，不需要扫描内容流。
+
+对于 \texttt{GET(D, ``/orders/order/item/name'')}，路径索引只能确认路径存在，实际值仍需按文档序扫描内容流。内容流中的第一条匹配记录是 $(6,3)$，通过 token 字典反查得到 \texttt{机械键盘}，因此函数返回该值；第二条 $(6,5)$ 对应 \texttt{鼠标}，在当前“返回首个匹配值”的语义下不会被返回。该例说明，路径索引解决的是路径存在性，而文档序内容流承担首值定位和重复路径的顺序语义。
+
+\begin{table}[htbp]
+\centering
+\small
+\caption{示例 XML 上的路径查询正例与负例}
+\label{tab:query-example-path}
+\begin{tabular}{p{0.39\linewidth}p{0.18\linewidth}p{0.32\linewidth}}
+\toprule
+查询 & 期望结果 & 说明 \\
+\midrule
+\texttt{EXISTS(/orders/order/item/name)} & true & 路径索引存在 \texttt{path\_id=6}。 \\
+\texttt{EXISTS(/orders/order/price)} & false & 路径字典未命中，不访问内容流。 \\
+\texttt{GET(/orders/order/item/name)} & 机械键盘 & 扫描到首条 $(6,3)$ 后返回 token 的反查值。 \\
+\texttt{GET(/orders/order/discount)} & NULL & 路径不存在，无法找到匹配内容记录。 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{路径索引、Bloom 过滤与候选验证}
+
+路径索引、Bloom 和 GIN 面向不同范围。路径索引在单文档内定位路径标识；Bloom 在单文档内快速否定 token；GIN 在整个表范围内为内容 token 生成候选行。其协作关系是：GIN 先减少需要访问的行，逐行谓词及必要的精确复核保证操作语义；没有 GIN 时，Bloom 可在顺序扫描的每个文档内减少部分内容扫描。GIN 不是利用每个文档的 Bloom 位图构造倒排项。
+
+Bloom 的正确性边界是“阴性可排除，阳性需确认”。GIN 的正确性边界是“索引键匹配生成候选，近似键需要 recheck”。二者不可混为一谈。Bloom 假阳性会增加内容扫描但不改变结果；长 token 哈希碰撞会增加索引候选，但必须通过实际字符串比较排除错误命中。
+
+当前 GIN 的 $\texttt{extractValue}$ 从内容流解码 token ID 并提取不同键，索引构建阶段因此仍有扫描和键提取工作；它不必从原始 XML 重新解析或执行通用文本分词。查询侧 $\texttt{extractQuery}$ 使用与编码相同的短 token 字典或长 token 哈希规则。$\texttt{consistent}$ 将可能命中的候选标记为需要 recheck；三值一致性路径将长 token 哈希候选保留为 MAYBE，避免错误地因索引键相同而跳过堆上精确检查。
+
+\section{PostgreSQL 操作符及 GIN 索引实现}
+
+本文原型将方法接入 PostgreSQL 自定义类型。输入函数将 XML 外部文本转换为压缩表示；输出函数根据结构流解码为 XML 文本表示。查询函数分别实现 $\texttt{xml\_contains}$、$\texttt{xml\_exists}$ 和 $\texttt{xml\_get}$。其中内容包含操作注册为可由 GIN 使用的操作符，GIN 操作类提供值键抽取、查询键映射和一致性判断回调。
+
+对于短 token，$\texttt{extractValue}$ 从压缩内容流提取 token ID，$\texttt{extractQuery}$ 通过共享字典得到查询 ID。字典未命中时，查询回调返回零个键，GIN 可直接得到空候选集。对于长 token，查询键使用内联哈希 ID，仍要求候选精确复核。索引端只负责高效生成候选，不改变 SQL 操作符定义的精确 token 包含语义。
+
+PostgreSQL 在本文中是方法的实现与验证平台。压缩编码中间数据复用原则理论上可以映射到其他存储引擎的自定义类型或索引接口，但各平台的字典持久化、多版本并发控制（Multi-Version Concurrency Control, MVCC）、应用程序编程接口（Application Programming Interface, API）、崩溃恢复和代价模型均不同。当前没有其他数据库上的实现或实验，因此这里只说明可迁移研究方向，不把迁移后的行为写成已验证结论。
+
+\section{本章小结}
+
+本章说明基于压缩表示的查询处理方法。精确内容查询利用字典、Bloom 和内容流分层判断；路径存在查询通过字典和排序路径索引查找；路径取值查询在路径确认后扫描文档序内容；GIN 负责跨文档候选定位，最终结果由精确谓词复核。方法复用的是编码阶段的语义 ID，Bloom、路径索引和 GIN 则在不同范围内发挥作用。下一章通过实验检验这些过程的正确性与成本。

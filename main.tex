@@ -1,0 +1,57 @@
+% !TEX program = xelatex
+% 论文主文件。原模板示例已另存为 main_template_example.tex。
+\documentclass[professional,public,library,mac,long,STEM,AutoFakeBold]{def/buaa}
+\usepackage{amsmath,amssymb,booktabs,longtable,multirow,listings,xcolor,enumitem,tikz,xurl}
+\usetikzlibrary{arrows.meta,positioning}
+\lstset{basicstyle=\ttfamily\small,breaklines=true,columns=fullflexible,frame=single}
+
+% 封面与学位信息：有“请核对/占位”的字段须在正式提交前核实。
+\Title{面向数据库 XML 类型的压缩与索引优化方法}{Compression and Indexing Optimization for XML Types in Databases}
+\Subtitle{学位论文初稿}{Thesis Draft}
+\Branch{工学}
+\Degree{Master of Electronic Information}
+\Department{软件学院}{School of Software}
+\Major{软件工程}
+\Feild{数据库 XML 压缩与索引优化}
+\Discipline{软件工程}
+\Direction{数据库 XML 压缩与索引优化}
+\Tutor{刘子鹏}{Liu Zipeng}{副教授}
+\Author{周志强}{Zhou Zhiqiang}
+\StudentID{ZF2421124}
+\CLC{TK16（请核对分类号）}
+% 原 PDF 未提供日期，暂留空；请在正式提交前填写。
+\DateEnroll{}{}{}
+\DateGraduate{}{}{}
+\DateSubmit{}{}{}
+\DateDefence{}{}{}
+
+% 摘要按正文方法与实验范围统一修订，避免沿用与正文不一致的“三段式模型”等表述。
+\Abstract{%
+针对数据库中 XML 数据的存储与查询需求，本文研究一种面向查询的结构感知压缩与索引优化方法。该方法在解析 XML 时识别元素路径、文本值和节点结构，将路径及值映射为可复用标识，并组织为文档序内容流、路径辅助信息、Bloom Filter 元数据、长值内联区和结构流。查询与索引键提取复用编码阶段形成的标识，以减少重复解析和重复识别；对于 Bloom Filter 或哈希产生的候选，仍通过精确验证保证结果正确。本文在 PostgreSQL 扩展原型中实现相关数据表示、XPath 导向查询函数及 GIN 索引操作类，并通过正确性检查和实验观察评估其存储与查询表现。实验显示，在所测数据与配置下，压缩列值相较原生 XML 列值有所减少；与 text[] + GIN 工程基线的查询延迟接近。该结果体现了压缩、查询与索引之间的空间和处理代价权衡，不构成对其他可查询压缩系统或数据库平台的普遍性能结论。
+}{%
+This thesis studies a structure-aware, query-oriented compression and indexing method for XML data stored in databases. During XML parsing, the method identifies element paths, text values, and node structure, maps paths and values to reusable identifiers, and organizes them into a document-order content stream, path metadata, Bloom Filter metadata, an inline area for long values, and a structural stream. Queries and index-key extraction reuse identifiers produced during encoding to reduce repeated parsing and recognition. Candidates produced by Bloom Filters or hashes are subject to exact verification to preserve result correctness. The method is implemented in a PostgreSQL extension prototype with a binary representation, XPath-oriented query functions, and a GIN operator class, and is evaluated through correctness checks and empirical measurements. Under the tested data and configuration, the compressed column values are smaller than native XML column values, while query latency is close to that of the text[] + GIN engineering baseline. These results illustrate trade-offs among compression, querying, and indexing; they do not establish general performance superiority over other queryable compressors or database platforms.
+}
+\Keyword{XML，结构感知压缩，压缩域查询，路径索引，GIN 索引}{XML, Structure-Aware Compression, Querying over Compressed Data, Path Index, GIN Index}
+\Listfigtab{on}
+\Abbreviations{\centering
+\begin{tabular}{lll}
+外文缩略字母 & 外文全称 & 中文说明\\
+XML & Extensible Markup Language & 可扩展标记语言\\
+XPath & XML Path Language & XML 路径语言\\
+GIN & Generalized Inverted Index & 通用倒排索引\\
+Bloom Filter & Bloom Filter & 布隆过滤器\\
+SQL & Structured Query Language & 结构化查询语言\\
+\end{tabular}}
+
+\begin{document}
+% 以下章节按模板“tex/独立章节文件”结构组织。
+\input{tex/chap_thesis_01}
+\input{tex/chap_thesis_02}
+\input{tex/chap_thesis_03}
+\input{tex/chap_thesis_04}
+\input{tex/chap_thesis_05}
+\input{tex/chap_thesis_06}
+\input{tex/chap_thesis_conclusion}
+\input{tex/chap_thesis_references}
+% 附录/致谢/成果页待正文材料补齐后，再启用模板相应 tex 文件。
+\end{document}
