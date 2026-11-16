@@ -1,10 +1,46 @@
-._论文撰写规范.pdf
-._*
+# 只忽略编译中间文件及 macOS 元数据，不使用目录白名单。
+# def/、tex/、pic/ 下的模板、源码、字体、图片和其他项目材料均保留。
+# 明确保留参考文献样式、EPS 图片和全部 PDF（包括 main.pdf）。
+!*.bst
+!*.eps
+!*.pdf
+
+# LaTeX / BibTeX / latexmk 中间文件
 *.aux
 *.bbl
+*.bcf
 *.blg
+*.fdb_latexmk
+*.fls
 *.lof
 *.log
 *.lot
 *.out
 *.toc
+*.xdv
+*.dvi
+*.synctex
+*.synctex.gz
+*.synctex(busy)
+*.synctex.gz(busy)
+*.run.xml
+*.idx
+*.ilg
+*.ind
+*.glo
+*.glg
+*.gls
+*.glsdefs
+*.acn
+*.acr
+*.alg
+*.loa
+*.lol
+*.nav
+*.snm
+*.vrb
+*.xdv(busy)
+
+# macOS 元数据（不是 PDF 或图片本体）
+.DS_Store
+._*
