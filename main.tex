@@ -25,13 +25,29 @@
 \DateSubmit{}{}{}
 \DateDefence{}{}{}
 
-% 摘要按正文方法与实验范围统一修订，避免沿用与正文不一致的“三段式模型”等表述。
+% 中英文摘要按“研究问题—主要工作—验证结果”组织，与正文方法及实验结论一致。
 \Abstract{%
-针对数据库中 XML 数据的存储与查询需求，本文研究一种面向查询的结构感知压缩与索引优化方法。该方法在解析 XML 时识别元素路径、文本值和节点结构，将路径及值映射为可复用标识，并组织为文档序内容流、路径辅助信息、Bloom Filter 元数据、长值内联区和结构流。查询与索引键提取复用编码阶段形成的标识，以减少重复解析和重复识别；对于 Bloom Filter 或哈希产生的候选，仍通过精确验证保证结果正确。本文在 PostgreSQL 扩展原型中实现相关数据表示、XPath 导向查询函数及 GIN 索引操作类，并通过正确性检查和实验观察评估其存储与查询表现。实验显示，在所测数据与配置下，压缩列值相较原生 XML 列值有所减少；与 text[] + GIN 工程基线的查询延迟接近。该结果体现了压缩、查询与索引之间的空间和处理代价权衡，不构成对其他可查询压缩系统或数据库平台的普遍性能结论。
+数据库中的 XML 数据既需要紧凑存储，也需要支持路径访问和内容检索。重复出现的标签、路径和文本值带来存储开销，查询所需的辅助信息又会增加数据体积。为在减少存储空间的同时保持高效查询能力，本文以结构感知压缩表示为基础，研究压缩编码中间数据的复用，使路径和值标识继续用于查询处理和索引构建，减少重复存储、重复解析和字符串处理。主要工作如下。
+
+首先，提出面向查询的 XML 结构感知压缩表示方法。根据 XML 的元素层次和文本内容，分别生成文档序内容记录和前序结构记录，保存路径与叶文本的对应关系，以及节点层次和顺序。利用共享字典将重复路径和短文本值转换为整数标识，再通过变长整数进行紧凑编码，在保留文档恢复所需信息的同时，为直接查询压缩表示提供基础。
+
+其次，提出基于压缩编码中间数据复用的查询处理方法。将查询条件转换为与文档编码一致的路径和值标识，通过标识比较完成路径存在判断和精确内容匹配，并按照文档顺序提取目标路径的首个文本值。利用编码阶段形成的路径信息和内容过滤摘要减少查询访问，对候选结果执行精确检查。在此基础上，直接从压缩表示中提取值标识作为倒排索引键，使同一份编码信息同时服务于压缩存储、文档内查询和索引检索。
+
+最后，以 PostgreSQL 为验证平台实现原型，利用业务 XML 数据评价正确性、存储开销、查询性能和构建成本。在本文约定的信息保留范围内，文档恢复和查询结果与独立解析结果一致。在一万份文档的实验中，本文方法的平均列值大小较原生 XML 减少 20.17\%。在相同的完整短叶文本精确匹配任务下，与保留原始 XML、额外保存叶文本数组并建立倒排索引的方案相比，将一份共享字典全额计入后，总存储开销减少 34.38\%，索引查询延迟与对照方案接近。本文方法的数据转换入库与索引构建总耗时较高，存储和查询收益需要结合预处理成本进行评价。
+
+研究结果表明，复用压缩编码中间数据能够在节省存储空间的同时保持高效查询，为数据库 XML 类型的压缩与索引优化提供了一种可行方法。
 }{%
-This thesis studies a structure-aware, query-oriented compression and indexing method for XML data stored in databases. During XML parsing, the method identifies element paths, text values, and node structure, maps paths and values to reusable identifiers, and organizes them into a document-order content stream, path metadata, Bloom Filter metadata, an inline area for long values, and a structural stream. Queries and index-key extraction reuse identifiers produced during encoding to reduce repeated parsing and recognition. Candidates produced by Bloom Filters or hashes are subject to exact verification to preserve result correctness. The method is implemented in a PostgreSQL extension prototype with a binary representation, XPath-oriented query functions, and a GIN operator class, and is evaluated through correctness checks and empirical measurements. Under the tested data and configuration, the compressed column values are smaller than native XML column values, while query latency is close to that of the text[] + GIN engineering baseline. These results illustrate trade-offs among compression, querying, and indexing; they do not establish general performance superiority over other queryable compressors or database platforms.
+XML data in databases require compact storage and efficient path and content queries. Repeated tags, paths, and values consume space, while query structures add overhead. This thesis reuses identifiers produced during structure-aware compression for query processing and index construction, reducing redundant storage, parsing, and string processing.
+
+First, a structure-aware compression method generates document-order content records and preorder structural records, preserving path-to-text associations, node hierarchy, and ordering. Shared dictionaries map repeated paths and short text values to identifiers. Variable-length integer encoding supports compact storage, direct queries, and reconstruction.
+
+Second, query conditions use the same identifiers as document encoding to check path existence, match complete text values, and retrieve the first text value at a path. Path information and content-filtering summaries reduce data access, with exact candidate verification ensuring correctness. Value identifiers extracted from compressed data also serve as inverted-index keys, linking storage, document-level queries, and indexed retrieval.
+
+Finally, a PostgreSQL prototype is evaluated using application-derived XML data. Reconstruction and query results agree with independent parsing under the specified preservation requirements. For 10,000 documents, average column-value size is 20.17\% smaller than native XML. For identical exact-match queries on complete short leaf-text values, total storage, including one full shared dictionary, is 34.38\% lower than a baseline retaining the original XML, a leaf-text array, and its inverted index, with similar indexed-query latency. Combined conversion, loading, and index-construction time is higher, requiring preprocessing costs to be considered.
+
+These results support intermediate encoding data reuse as a feasible approach to saving space while maintaining efficient XML queries.
 }
-\Keyword{XML，结构感知压缩，压缩域查询，路径索引，GIN 索引}{XML, Structure-Aware Compression, Querying over Compressed Data, Path Index, GIN Index}
+\Keyword{XML，结构感知压缩，编码中间数据复用，压缩域查询，索引优化}{XML, Structure-Aware Compression, Reuse of Intermediate Encoding Data, Querying over Compressed Data, Index Optimization}
 \Listfigtab{on}
 \Abbreviations{\centering
 \begin{tabular}{lll}
@@ -49,7 +65,6 @@ SQL & Structured Query Language & 结构化查询语言\\
 \input{tex/chap_thesis_02}
 \input{tex/chap_thesis_03}
 \input{tex/chap_thesis_04}
-\input{tex/chap_thesis_05}
 \input{tex/chap_thesis_06}
 \input{tex/chap_thesis_conclusion}
 \input{tex/chap_thesis_references}

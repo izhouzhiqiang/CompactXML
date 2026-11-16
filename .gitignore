@@ -44,3 +44,7 @@
 # macOS 元数据（不是 PDF 或图片本体）
 .DS_Store
 ._*
+
+# tmp
+tmp/*
+workspace/*

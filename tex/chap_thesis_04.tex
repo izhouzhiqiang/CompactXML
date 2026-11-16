@@ -1,257 +1,286 @@
 % !TeX root = ../main.tex
-\chapter{面向查询的 XML 压缩表示方法}
+\chapter{基于编码复用的 XML 查询处理方法}
+\label{chap:query-reuse}
 
-\section{方法总体思路与设计目标}
+第三章介绍了压缩表示，其中保存了路径标识、值标识、按文档顺序排列的内容记录和前序结构记录。本章在此基础上研究查询方法，使查询条件、文档内判断和索引检索使用同一组编码信息。首先定义查询操作，随后阐述内容查询、路径访问和数据库索引的处理方法，并结合 PostgreSQL 原型说明实现方式，最后分析查询正确性及执行开销。
 
-本文方法以“编码阶段识别的信息继续服务于查询阶段”为主线。输入 XML 经语义解析后形成叶路径—文本记录和完整节点结构记录；编码过程将路径和值映射到相应字典标识。方法不把这些标识仅视为压缩字节流的临时产物，而是使同一标识契约贯穿压缩值构造、查询判断和索引键提取，避免各阶段重复识别同一语义对象。索引构建仍需扫描并解码压缩内容流，因此“复用”不等于消除索引键提取成本。
+\section{查询模型与执行框架}
+\subsection{查询操作及返回语义}
 
-设 $D$ 为符合原型输入约束的 XML 文档。解析后得到文档序叶记录
-\[
-R_D=\langle(p_i,v_i)\rangle_{i=1}^{n}
-\]
-和前序节点记录
-\[
-T_D=\langle(t_j,c_j)\rangle_{j=1}^{m},
-\]
-其中，$p_i$ 是叶元素的完整路径，$v_i$ 是其解析后文本，$t_j$ 是节点路径，$c_j$ 是子节点数。路径和值字典分别定义映射 $\phi_p$ 与 $\phi_v$；在当前字典生命周期内，每个已注册路径或短值映射到唯一 ID。值标识函数定义为
-\[
-\eta_v(v)=\begin{cases}
-\phi_v(v), & |v|_{\mathrm{UTF8}}<1024,\\
-\operatorname{tag}(H_{32}(v)), & |v|_{\mathrm{UTF8}}\ge 1024.
-\end{cases}
-\]
-长值哈希仅用于候选定位，不能替代原文比较。编码中间表示为
-\[
-M(D)=(E_D,P_D,F_D,L_D,S_D),\qquad B_D=\operatorname{serialize}(M(D)),
-\]
-其中 $E_D=\langle(\phi_p(p_i),\eta_v(v_i))\rangle$ 是保留文档顺序的内容序列；$P_D$ 是由节点路径及叶记录数构成的有序路径摘要；$F_D$ 是由内容值标识构成的 Bloom 摘要；$L_D$ 保存长值内联候选；$S_D$ 是使用同一路径标识表达的前序结构序列。编码器、查询算子和索引键提取器对同一受支持路径或短文本使用同一字典映射；长文本哈希只作候选标识，之后仍须精确复核。
+设 $D$ 为第三章约定范围内的文档，$B_D$ 为其编码对象。本文围绕 XPath 中的路径选择和叶文本相等条件，定义表~\ref{tab:query-model} 所列三类操作。文本比较采用解析后的完整 UTF-8 字节值，路径采用根到元素的完整标签序列。
+\begin{table}[htbp]
+\centering\small
+\caption{查询操作及返回语义}
+\label{tab:query-model}
+\begin{tabular}{p{0.24\linewidth}p{0.43\linewidth}p{0.22\linewidth}}
+\toprule
+操作 & 判断或获取内容 & 返回结果 \\
+\midrule
+$\operatorname{EXISTS}(D,p)$ & 是否存在路径为 $p$ 的元素，含内部元素和空叶 & 布尔值 \\
+$\operatorname{CONTAINS}(D,t)$ & 是否存在完整叶文本等于非空查询值 $t$ & 布尔值；空查询值为 false \\
+$\operatorname{GET}(D,p)$ & 按文档顺序获取路径为 $p$ 的首个叶文本 & 文本；无对应叶记录为 NULL \\
+\bottomrule
+\end{tabular}
+\end{table}
+对于原生 XML，可分别通过完整路径选择、叶元素文本相等判断和首个匹配叶节点文本获取构造参照操作[3]。设参照结果为 $Q_{\mathrm{ref}}(D,x)$，压缩表示上的操作应满足
+\begin{equation}
+Q(B_D,x)=Q_{\mathrm{ref}}(D,x),\qquad
+Q\in\{\operatorname{EXISTS},\operatorname{CONTAINS},\operatorname{GET}\}.
+\label{eq:query-equivalence}
+\end{equation}
+其中，内容查询比较完整叶文本，路径取值采用首值约定；内部元素的后代文本聚合属于另一种取值语义。将返回规则集中定义，有利于压缩表示、原生 XML 参照和索引操作符采用一致的判断标准。
 
-该方法可由三项性质检验：同一语义值在规定字典作用域内具有一致 ID；派生摘要只减少候选判断工作而不改变精确结果；结构与内容两类编码信息共同支持所定义语义下的解码。处理流程如图~\ref{fig:xml-encoding-flow} 所示。
+\subsection{查询条件与编码标识的对应}
 
+路径条件使用编码阶段的路径字典映射 $\phi_p$，短文本条件使用值字典映射 $\phi_v$。使用同一字典时，相同字符串对应相同标识，不同字符串对应不同标识。若字典中不存在目标字符串，查询即可返回不匹配；否则，继续在目标文档中查找对应标识。
+
+长文本条件采用与写入相同的带标记哈希得到候选标识，并使用原文比较完成确认。查询阶段执行查找和条件编码，标识分配由写入阶段负责。由此，查询条件、内容记录与索引键遵守同一套映射约定。
+
+\subsection{文档内访问与关系级访问}
+
+查询执行分为文档内和关系级两个层次。文档内访问面向一个压缩对象，通过路径区、Bloom 摘要及内容流完成判断或取值；关系级访问面向数据库中的多行文档，通过 GIN 倒排结构定位包含目标键的候选行。索引检索之后，执行器按操作类给出的精确性信息决定是否回表复核。
 \begin{figure}[htbp]
 \centering
-\begin{tikzpicture}[node distance=5mm, every node/.style={draw,rounded corners,align=center,text width=0.72\linewidth,minimum height=7mm,font=\small}, arrow/.style={-{Stealth[length=2mm]},thick}]
-\node (xml) {输入 XML 文档};
-\node (parse) [below=of xml] {解析并生成文档序叶记录与前序节点记录};
-\node (dict) [below=of parse] {通过共享字典确定 \texttt{path\_id} 与 \texttt{token\_id}};
-\node (streams) [below=of dict] {生成文档序内容流与前序结构流};
-\node (aux) [below=of streams] {派生排序路径索引、Bloom 摘要及长值内联区};
-\node (serialize) [below=of aux] {序列化为可解码的二进制压缩表示};
-\node (query) [below=of serialize] {查询函数与 GIN 键提取复用编码标识};
-\draw[arrow] (xml)--(parse); \draw[arrow] (parse)--(dict); \draw[arrow] (dict)--(streams);
-\draw[arrow] (streams)--(aux); \draw[arrow] (aux)--(serialize); \draw[arrow] (serialize)--(query);
+\begin{tikzpicture}[box/.style={draw,rounded corners=2pt,align=center,font=\small,inner sep=5pt},flow/.style={-{Stealth[length=1.8mm]},thick}]
+\node[box,text width=9.0cm] (q) at (0,0) {查询条件映射：复用路径字典、值字典与长值哈希规则};
+\node[box,text width=4.4cm] (scan) at (-2.9,-1.5) {顺序访问路径\\逐行调用文档内操作};
+\node[box,text width=4.4cm] (gin) at (2.9,-1.5) {GIN 访问路径\\按内容键生成候选行};
+\node[box,text width=9.0cm] (local) at (0,-3.2) {文档内判断或候选复核\\路径区定位；Bloom 排除；内容 ID 匹配；长值原文比较};
+\node[box,text width=9.0cm] (out) at (0,-4.7) {按操作语义返回布尔值、首个叶文本或匹配数据库行};
+\draw[flow] (q)--(scan);\draw[flow] (q)--(gin);
+\draw[flow] (scan)--(local);\draw[flow] (gin)--node[right,font=\scriptsize]{需复核候选}(local);
+\draw[flow] (local)--(out);
 \end{tikzpicture}
-\caption{XML 编码与中间数据复用流程}
-\label{fig:xml-encoding-flow}
+\caption{编码复用查询的文档内与关系级执行层次}
+\label{fig:query-layers}
 \end{figure}
+路径区解决目标路径在单文档中的出现判断，Bloom 摘要减少部分内容扫描，GIN 缩小关系中需要访问的文档集合。三者在不同层次衔接，其共同依据是写入时确定的编码标识。
 
-方法设计目标包括：将路径和值冗余压缩为可复用标识；保留解码所需的顺序和结构；使目标查询能够消费表示中的索引或内容区；明确候选、精确验证和外部字典各自的边界；避免把局部有效的组件特性夸大为端到端性能保证。路径索引、Bloom 元数据及 GIN 键提取共享编码阶段的 ID，但各自作用范围不同。字典的稳定作用域是当前 PostgreSQL 数据目录，不表示跨集群 ID 永久一致。
+\section{精确内容查询方法}
+\subsection{短文本值的标识匹配}
 
-**方法过程 1：编码中间表示复用。** 输入为 XML 文档 $D$ 及路径、短 token 字典 $\Delta_p,\Delta_v$；输出为压缩值 $B_D$ 及其解码所需的结构信息。伪代码如下。
-
-\begin{lstlisting}[caption={编码中间表示复用过程},label={lst:encode-reuse}]
-R, T <- parse_once(D)
-E <- empty ordered content sequence
-PairCount <- empty path-to-leaf-pair-count map
-F <- empty Bloom filter; I <- empty inline-token map
-
-for each node in preorder records T:
-    pid <- lookup_or_assign(Delta_p, node.path)
-    PairCount.setdefault(pid, 0)
-
-for each (path, value) in document-ordered leaf records R:
-    pid <- lookup_or_assign(Delta_p, path)
-    if UTF8_byte_length(value) < 1024:
-        vid <- lookup_or_assign(Delta_v, value)
+对非空短文本 $t$，首先从共享字典查找值 ID $v_t$。若查找成功，则检查该文档的 Bloom 摘要；摘要通过后，顺序解码内容流中的值 ID。发现 $v_t$ 即可确认匹配，扫描结束仍无相同标识则返回 false。代码~\ref{lst:contains-reuse} 给出包含长值分支的完整处理流程。
+\begin{lstlisting}[caption={复用值标识的精确内容查询},label={lst:contains-reuse},numbers=none]
+Contains(B, t):
+    if t == "": return false
+    is_long <- (ByteLengthUTF8(t) >= 1024)
+    if is_long:
+        vid <- TaggedHash(t)
     else:
-        vid <- tagged_inline_hash(value)
-        if I contains vid and I[vid] != value: reject document
-        I[vid] <- value
-    append (pid, vid) to E
-    PairCount[pid] <- PairCount[pid] + 1
-    insert vid into F
-
-S <- encode preorder records T using the same path IDs
-Pidx <- sort PairCount by pid
-B_D <- serialize(header, Pidx, E, I, F, S)
-return B_D
+        vid <- Lookup(Delta_v, t)
+        if vid is absent: return false
+    if BloomEnabled(B) and not BloomMayContain(B, vid):
+        return false
+    for (pid, stored_vid) in DecodeContent(B):
+        if stored_vid == vid:
+            if not is_long: return true
+            if InlineValueEquals(B, vid, t): return true
+    return false
 \end{lstlisting}
+短值查询的正确性由字典映射保证：在同一字典中，每个 ID 对应一个完整叶文本，因此比较 ID 即可判断短值是否相等。读取内容记录时需要解码路径 ID 和值 ID，内容是否匹配则由值 ID 决定。
 
-这里的“复用”有明确含义：路径索引及 Bloom 由解析和编码时形成的内容信息派生；GIN 建索引时从序列化压缩内容中提取同一 token ID，查询侧再按相同字典映射查询字符串。因此，GIN 的键提取仍有扫描压缩流的成本，但不必重新解析原始 XML 或另行推断 token 边界。
+\subsection{Bloom 过滤与负例处理}
 
-设文档含 $n$ 条叶记录、$u$ 个不同路径索引项，Bloom 使用 $k$ 次位探测。排序路径索引上的路径存在查询需要 $O(\log u)$ 次比较；路径取值还要扫描内容流，最坏为 $O(\log u+n)$；Bloom 给出否定结果时需 $O(k)$ 次探测，可能阳性或关闭 Bloom 时仍可能扫描 $O(n)$ 条内容记录；GIN 为单个压缩值提取键也需解码其内容记录，成本随 $n$ 增长。上述渐进界不包括解析、字典查找、序列化及数据库 I/O 的端到端成本。
+写入时，文档全部内容值 ID 均已加入 Bloom Filter。在映射和位数组保持一致时，真实存在的值必然通过摘要检查[22]。对订单文档查询“机械键盘”，得到值 ID 3，摘要检查通过后在内容记录 $(6,3)$ 中精确匹配，返回 true。
 
-\section{XML 结构与内容的编码表示}
+负例则可能在不同阶段结束。查询“耳机”时，若该字符串未登记于共享短值字典，可在字典查找阶段返回 false；若字典已在其他文档中登记该值，而当前对象的摘要有任一探测位为 0，则在 Bloom 检查阶段返回 false；若摘要返回可能存在，则通过内容流扫描确认该文档是否含有目标值。表~\ref{tab:query-example-content} 汇总相应路径。
+\begin{table}[htbp]
+\centering\small
+\caption{订单示例上的内容查询及判定阶段}
+\label{tab:query-example-content}
+\begin{tabular}{p{0.17\linewidth}p{0.15\linewidth}p{0.57\linewidth}}
+\toprule
+查询情形 & 结果 & 判定过程 \\
+\midrule
+机械键盘 & true & 字典映射为 3，Bloom 通过，内容流匹配 $(6,3)$ \\
+耳机：字典缺失 & false & 相同字典作用域内没有相应短值标识 \\
+耳机：Bloom 排除 & false & 字典已登记，当前文档至少一个探测位为 0 \\
+耳机：Bloom 通过 & false & 内容流扫描结束，无相同值 ID \\
+10 & false & 按完整叶文本相等判断，已有值 1001 与查询值不同 \\
+\bottomrule
+\end{tabular}
+\end{table}
+上述“耳机”分支分别对应字典状态和摘要状态，是同一负例在不同前提下的执行情况。Bloom 的位状态由实际哈希规则和已插入标识共同决定。摘要空间、集合规模及值分布影响通过比例，精确内容判断统一由后续标识比较完成。
 
-\subsection{贯穿本章的 XML 示例}
+\subsection{长文本候选与原文验证}
 
-为了说明 XML 从文本到压缩表示的转换过程，本文使用如下 XML 文档作为贯穿本章的示例。该文档包含重复的 \texttt{item} 容器、重复的 \texttt{name} 和 \texttt{quantity} 路径，能够体现结构感知压缩和文档序信息保留的作用。
+长文本查询首先计算与写入一致的哈希标识，在摘要和内容流中定位候选；对相同标识，再从内联区取得原文并按字节比较。若两个不同长值在不同文档中具有相同哈希值，二者可能进入同一候选集合，原文比较将区分真实匹配与碰撞候选。
 
-\begin{lstlisting}[caption={用于说明编码过程的 XML 示例},label={lst:encoding-xml-example}]
-<orders>
-  <order>
-    <id>1001</id>
-    <customer>张三</customer>
-    <item>
-      <name>机械键盘</name>
-      <quantity>2</quantity>
-    </item>
-    <item>
-      <name>鼠标</name>
-      <quantity>1</quantity>
-    </item>
-  </order>
-</orders>
+在这一过程中，哈希和 Bloom Filter 用于筛选候选，内联保存的原文用于确认完整文本是否相等。第三章的文档内冲突检查保证同一对象中的标识可以找到对应原文；查询时通过原文比较，区分不同文档中具有相同哈希值的长文本。
+
+\section{路径访问方法}
+\subsection{路径存在性判断}
+
+对于完整路径 $p$，先查找路径 ID $u_p$，再在文档的排序路径区中执行二分查找。找到条目即表示该路径在文档中出现，条目关联的内容记录数用于描述其叶内容数量。由于路径区包含所有元素路径，内部节点与空叶均具有存在性信息。
+\begin{lstlisting}[caption={路径存在与首值提取},label={lst:path-reuse},numbers=none]
+Exists(B, p):
+    pid <- Lookup(Delta_p, p)
+    if pid is absent: return false
+    return BinarySearchPathEntry(B, pid) is present
+
+GetFirst(B, p):
+    pid <- Lookup(Delta_p, p)
+    if pid is absent: return NULL
+    if BinarySearchPathEntry(B, pid) is absent: return NULL
+    for (stored_pid, vid) in DecodeContentInOrder(B):
+        if stored_pid == pid:
+            return ResolveValue(Delta_v, Inline(B), vid)
+    return NULL
 \end{lstlisting}
+例如，商品容器路径映射为 ID 5，该条目的叶内容计数为 0，但路径存在结果仍为 true。存在性依据元素路径集合，内容计数反映另一层次的关联信息。
 
-解析器维护当前路径栈。遇到开始标签时压入标签，遇到结束标签时弹出标签；遇到叶节点文本时，记录当前完整路径和文本值。由此得到文档序叶记录
-\[
-R_D=\langle
-(\texttt{/orders/order/id},\texttt{1001}),
-(\texttt{/orders/order/customer},\texttt{张三}),
-(\texttt{/orders/order/item/name},\texttt{机械键盘}),
-(\texttt{/orders/order/item/quantity},\texttt{2}),
-(\texttt{/orders/order/item/name},\texttt{鼠标}),
-(\texttt{/orders/order/item/quantity},\texttt{1})
-\rangle.
-\]
-该顺序与 XML 中叶节点的出现顺序一致，因而可以支持路径取值的首值语义，也可以在解码时恢复叶节点次序。
+\subsection{路径值提取}
 
-仅有 $R_D$ 仍不足以恢复完整 XML 树。为此，解析器同时生成前序结构记录 $T_D$，其中每条记录由节点路径和直接子节点数构成。例如，根节点 \texttt{/orders} 的子节点数为 1，\texttt{/orders/order} 的子节点数为 4，两个重复的 \texttt{/orders/order/item} 节点的子节点数均为 2，而叶节点的子节点数为 0。解码器按前序读取结构记录；读取到内部节点时创建容器节点，读取到叶节点时消费内容流中的下一条记录。这样，内容流负责保存文本及其顺序，结构流负责保存节点边界和嵌套关系。
+路径首值提取在路径确认后，按文档顺序读取内容记录，返回首条路径 ID 相同记录的文本。短值通过字典反查，长值通过内联区取得原文。对于商品名称路径，内容记录依次出现 $(6,3)$ 和 $(6,5)$，因此首值为“机械键盘”。
 
-\subsection{路径和值的标识化}
+该访问过程同时利用两类信息：排序路径条目提供存在性预检查，文档序内容流提供路径与文本的关联及首值顺序。路径条目保存的是内容记录数，具体内容位置由顺序解码确定。
 
-对上述示例，在一个确定的字典作用域内，可以建立如下路径字典和短文本字典。表中的具体整数仅用于说明编码过程，实际 ID 取决于字典注册顺序。
+\subsection{重复路径与空节点处理}
 
+重复路径、内部节点与空叶具有不同的结果特征。表~\ref{tab:path-example-semantics} 以订单示例为主体，另设在订单中增加空叶元素的情形，说明这些差异。
 \begin{table}[htbp]
-\centering
-\small
-\caption{XML 示例的路径和值标识}
-\label{tab:xml-example-dictionary}
-\begin{tabular}{p{0.58\linewidth}p{0.18\linewidth}p{0.18\linewidth}}
+\centering\small
+\caption{路径存在与首值提取的结果对应}
+\label{tab:path-example-semantics}
+\begin{tabular}{p{0.27\linewidth}p{0.16\linewidth}p{0.16\linewidth}p{0.29\linewidth}}
 \toprule
-路径或文本值 & 类型 & 标识 \\
+路径或情形 & EXISTS & GET & 依据 \\
 \midrule
-\texttt{/orders} & path & 1 \\
-\texttt{/orders/order} & path & 2 \\
-\texttt{/orders/order/id} & path & 3 \\
-\texttt{/orders/order/customer} & path & 4 \\
-\texttt{/orders/order/item} & path & 5 \\
-\texttt{/orders/order/item/name} & path & 6 \\
-\texttt{/orders/order/item/quantity} & path & 7 \\
-\texttt{1001} & token & 1 \\
-\texttt{张三} & token & 2 \\
-\texttt{机械键盘} & token & 3 \\
-\texttt{2} & token & 4 \\
-\texttt{鼠标} & token & 5 \\
-\texttt{1} & token & 6 \\
+商品名称路径 & true & 机械键盘 & 两条记录中取文档序首值 \\
+商品容器路径 & true & NULL & 结构路径存在，无对应叶内容 \\
+支付路径 & false & NULL & 文档路径集合中无此路径 \\
+增加空叶 note 后 & true & 空字符串 & 元素存在，叶记录保存空值 \\
 \bottomrule
 \end{tabular}
 \end{table}
+空叶路径的取值为空字符串，缺少叶内容记录时取值为 NULL。内容包含操作对空查询值返回 false，以对应本文采用的叶文本节点存在与相等判断。各操作分别依据其返回语义处理同一表示，保持结构存在与文本匹配之间的区别。
 
-因此，叶记录可以由字符串对转换为整数对：
+\section{基于编码标识的关系级索引}
+\subsection{索引键抽取}
+
+在文档内访问方法的基础上，关系级索引用于先确定需要检查的数据库行。两者共同读取压缩对象中的内容信息，但承担的任务不同：文档内查询判断对象是否满足条件，关系级索引利用值键的倒排集合缩小对象访问范围。需要复核的候选继续由前述文档内方法判断。
+
+关系级索引利用内容流中的值标识建立键到数据库行的映射。对文档 $D$，定义其去重键集合为
 \[
-\begin{aligned}
-R_D' = \langle &(3,1),(4,2),(6,3),\\
-                 &(7,4),(6,5),(7,6)\rangle.
-\end{aligned}
+K(D)=\operatorname{unique}\{t_i\mid(p_i,t_i)\in E_D\}.
 \]
-内容流保存 $R_D'$ 的文档序顺序，而不是按路径排序。路径索引另行保存路径标识及其内容记录数，例如 \texttt{path\_id=6} 的记录数为 2，\texttt{path\_id=7} 的记录数为 2；内部路径 \texttt{path\_id=5} 可以以记录数 0 保留在路径索引中，以支持路径存在判断。路径字典和 token 字典使用独立的 ID 空间，避免路径和文本值在查询语义上混淆。
+原型按内容记录数解码全部整数对，收集值 ID 后排序去重，再通过 GIN 操作类接口提供给索引[19]。该过程直接使用编码时已确定的文本边界与标识，所需工作包括内容读取、Varint 解码及键去重。
 
-解析阶段对输入文档进行树遍历，构造有序内容序列：
+订单示例的键集合为 $\{1,2,3,4,5,6\}$。同一值在文档内多次出现时，集合中保留一个键；其多次出现的顺序仍保存在内容流中。GIN 内容键由值标识抽取，Bloom 位数组作为对象级摘要另行使用。
+
+\subsection{查询键生成与候选检索}
+
+查询常量采用与文档相同的值映射。短值查询查找字典 ID，长值查询计算带标记哈希，再将所得整数作为 GIN 查询键。对于空查询值或字典缺失的短值，查询键抽取返回空键结果，并按操作类的搜索约定结束相应检索。
+
+设键 $v_t$ 的倒排集合为 $C(t)$。在索引完整、字典作用域一致且使用相同映射的条件下，真实匹配文档集合 $A(t)$ 满足
 \[
-C(D)=\langle(p_1,v_1),(p_2,v_2),\ldots,(p_n,v_n)\rangle,
+A(t)\subseteq C(t).
 \]
-其中 $p_i$ 是叶元素从根到叶的完整路径，$v_i$ 是解析后的文本值，序列顺序与 XML 中对应叶节点的文档顺序一致。内容序列可供查询和内容编码使用，但不足以独立还原所有树结构。因此，方法另生成前序结构序列：
-\[
-S(D)=\langle(\texttt{path\_id}_1,\texttt{child\_count}_1),\ldots,(\texttt{path\_id}_m,\texttt{child\_count}_m)\rangle.
-\]
-每个节点记录其路径标识和子节点数。内部节点按前序记录；叶节点的 $\texttt{child\_count}=0$ 与内容流中的下一个叶内容记录对应。解码器据结构序列恢复元素边界和子节点次序，并按叶记录填入文本。空叶节点可由空文本记录表示，内部空容器则由结构流本身保留。
+短值精确 ID 完整表达该内容谓词时，键匹配可以确定相应结果；长值哈希则保留可能相等的候选。当前原型以精确内容包含操作接入 GIN，路径存在和路径首值函数采用文档内访问过程。
 
-原型采用的逻辑二进制布局见表~\ref{tab:binary-layout}。该表描述逻辑区段，不表示所有文档都含有非空 Bloom 或内联区。
+\subsection{候选复核与结果正确性}
 
-\begin{table}[htbp]
+GIN 操作类根据键的精确程度向执行器报告候选状态。布尔一致性回调为候选设置复核标志；三值一致性回调对于确定的短值键可给出确定判断，对于长值哈希匹配保留可能匹配状态，使执行器调用精确内容谓词确认。需要回表复核时，过程重新使用前述内容查询方法。
+\begin{figure}[htbp]
 \centering
-\caption{逻辑二进制布局及区段内容}
-\label{tab:binary-layout}
-\begin{tabular}{lll}
+\begin{tikzpicture}[box/.style={draw,rounded corners=2pt,align=center,font=\small,inner sep=5pt},flow/.style={-{Stealth[length=1.8mm]},thick}]
+\node[box,text width=4.5cm] (stored) at (-2.9,0) {压缩内容流\\提取并去重值 ID};
+\node[box,text width=4.5cm] (query) at (2.9,0) {查询文本\\按相同映射生成键};
+\node[box,text width=9.0cm] (gin) at (0,-1.6) {GIN 倒排检索与一致性判断};
+\node[box,text width=4.5cm] (exact) at (-2.9,-3.2) {精确短值键\\按一致性判断返回};
+\node[box,text width=4.5cm] (recheck) at (2.9,-3.2) {长值哈希或待复核候选\\内容匹配与内联原文比较};
+\node[box,text width=9.0cm] (out) at (0,-4.8) {返回满足完整叶文本相等条件的数据库行};
+\draw[flow] (stored)--(gin);\draw[flow] (query)--(gin);
+\draw[flow] (gin)--(exact);\draw[flow] (gin)--(recheck);
+\draw[flow] (exact)--(out);\draw[flow] (recheck)--(out);
+\end{tikzpicture}
+\caption{编码键复用、候选检索与精确复核}
+\label{fig:gin-reuse-recheck}
+\end{figure}
+在前述候选覆盖条件下，精确检查只保留完整值相等的文档，因此验证后的集合等于 $A(t)$。键提取和查询映射保证真实匹配的文档进入候选集合，原文比较排除哈希碰撞，二者共同保证查询结果满足式~\eqref{eq:query-equivalence}。
+
+对三类文档内操作，也可依据第三章的表示不变量分别说明结果一致性：路径区覆盖全部元素路径，因此条目命中与相应路径存在一致；内容流保留完整值标识，短值的可区分映射与长值的原文比较保证相等判断准确，完整摘要保证真实匹配通过过滤；内容记录保持文档顺序，因此首个匹配路径对应参照操作的首个叶文本。索引层在这些判断基础上组织候选访问，使单文档语义与关系级检索相互衔接。
+
+\section{PostgreSQL 原型实现}
+\subsection{类型、函数与操作符接口}
+
+原型以自定义变长类型承载第三章的二进制对象，输入函数执行解析与编码，输出函数执行结构恢复。类型值依托 PostgreSQL 的变长存储机制接入表与 TOAST[20]；内容包含操作通过操作符及 GIN 操作类接入索引执行[19]。表~\ref{tab:prototype-interfaces} 列出必要接口，工程名称用于对应实际调用。
+\begin{table}[htbp]
+\centering\small
+\caption{抽象操作与原型接口的对应}
+\label{tab:prototype-interfaces}
+\begin{tabular}{p{0.20\linewidth}p{0.42\linewidth}p{0.27\linewidth}}
 \toprule
-区段 & 内容 & 长度（B）\\
+功能 & 原型接口 & 返回或访问方式 \\
 \midrule
-PostgreSQL varlena header & PostgreSQL TOAST/varlena 头 & 4\\
-CXHeader & 固定头 & 32\\
-Sorted path index & 路径索引区 & $4+8P$\\
-Document-order content stream & 文档序内容流 & $C$\\
-Optional inline-token section & 长值内联区 & $I$\\
-Bloom-filter section & Bloom 区 & $8+\lceil m/8\rceil$\\
-Preorder structure stream & 前序结构流 & $4+S$\\
+编码与恢复 & \texttt{compactxml\_in/out} & 类型输入与 XML 输出 \\
+路径存在 & \texttt{xml\_exists(doc,path)} & boolean，文档内路径区 \\
+内容匹配 & \texttt{xml\_contains(doc,value)} & boolean，摘要及内容流 \\
+路径首值 & \texttt{xml\_get(doc,path)} & text 或 NULL \\
+索引内容包含 & \texttt{doc @> value} & 判断内容是否存在，可用 GIN \\
+GIN 操作类 & \texttt{gin\_compactxml\_ops} & 值键抽取、候选与复核 \\
 \bottomrule
 \end{tabular}
 \end{table}
+查询函数接收解包后的类型值，按头部定位相关区段。SQL 接口采用严格参数约定，参数为 NULL 时遵循数据库的 NULL 传播规则；这与非空类型值内部的空叶文本处理分别对应不同情形。
 
-表中 $P$ 为路径索引项数，$C$ 为内容流长度，$I$ 为长值内联区长度，$m$ 为 Bloom 位数组长度（位），$S$ 为结构记录编码长度。各区段长度的组成见表~\ref{tab:binary-length}。
+\subsection{共享字典生命周期}
 
-\begin{table}[htbp]
-\centering
-\caption{逻辑二进制区段长度计算}
-\label{tab:binary-length}
-\begin{tabular}{p{0.25\linewidth}p{0.67\linewidth}}
-\toprule
-区段 & 长度及字段组成\\
-\midrule
-PostgreSQL 头 & 4 B，用于记录变长值的头部信息。\\
-固定头 & 32 B，由 8 个 $\texttt{uint32}$ 字段组成：版本、标志、字典 ID、总长度、3 个区段偏移及 Bloom 长度。\\
-路径索引区 & $4+8P$ B：4 B 的 $\texttt{path\_count}$、4 B 的 $\texttt{content\_pair\_count}$，以及 $P$ 个各占 8 B 的 $(\texttt{path\_id},\texttt{pair\_count})$ 条目。\\
-内容流 & $C=\sum_{i=1}^{N}[V(\texttt{path\_id}_i)+V(\texttt{token\_id}_i)]$ B；每条记录只保存两个变长整数 ID。\\
-长值内联区 & $I$ B，随内联长 token 的数量及其 UTF-8 字节长度变化。\\
-Bloom 区 & $8+\lceil m/8\rceil$ B；8 B 保存参数信息，后续为位数组。当前实现取 $m=\operatorname{nextpow2}(\max(1024,10N))$。\\
-结构流 & $4+S$ B，其中 $S=\sum_{j=1}^{M}[V(\texttt{path\_id}_j)+V(\texttt{child\_count}_j)]$；前 4 B 保存节点数。\\
-\bottomrule
-\end{tabular}
-\end{table}
+路径和值字典在数据库服务器共享内存中维护，通过锁协调查找与插入，持久化文件保留字符串与 ID 的对应关系。启动时载入字典，写入事务在提交前触发字典持久化；持久化过程使用临时文件、同步写入与文件替换组织更新。压缩对象中的标识需要由对应字典解释，因此备份和迁移时也需保留该字典。
 
-其中 $V(x)$ 表示对整数 $x$ 进行 Varint 编码后的字节数；$N$ 为内容对数量，$M$ 为节点数量。上述计算刻画逻辑表示长度，不等同于 PostgreSQL relation 的完整物理空间统计。
+字典条目采用追加组织。事务中止后，已登记而尚无已提交文档引用的条目可能继续留在共享内存，其生命周期与表中数据行存在差异。ID 的实际数值由登记次序决定，跨实例迁移应同时恢复字典或重新编码。原型的容量与字符串长度检查用于保证当前配置下的有效映射范围。
 
-以表~\ref{tab:xml-example-dictionary} 的示例为例，文档包含 $P=7$ 个路径索引项、$N=6$ 条叶内容记录和 $M=10$ 个节点。由于示例中的所有标识均小于 128，按当前 Varint 规则每个标识占 1 B，因而内容流长度为 $C=6\times(1+1)=12$ B，结构流编码长度为 $S=10\times(1+1)=20$ B。该文档没有长值内联区，Bloom 位数组按 $m=\operatorname{nextpow2}(\max(1024,10N))=1024$ 位计算，占 128 B，连同 8 B 参数区共 136 B。由此得到的逻辑长度为
+通过上述机制，数据写入和查询可以使用相同的字典映射。实验分别统计压缩列值和字典文件的大小；事务、并发及恢复能力的系统测试有待后续补充，本章按原型已经实现的功能说明处理过程。
+
+同一字典作用域内的多个文档共享字符串与 ID 的映射，每个压缩对象保存其引用的标识，而非各自复制一份完整字典。内容流中的短值标识既用于文档内匹配，也作为 GIN 值键的来源；查询端通过同一字典生成对应的查询键。因此，字典映射属于压缩对象及相关索引共同依赖的状态，迁移时应使三者保持一致。跨文档共享减少字典的重复保存，跨阶段复用减少对路径和值的重复识别，两种作用在存储核算和实验解释中分别考虑。
+
+\subsection{端到端执行示例}
+
+写入订单文档时，输入函数生成第三章的内容流、结构流和辅助区。建立 GIN 索引时，键抽取函数读取内容流并形成去重集合；查询时，路径或文本条件复用相应字典。以下 SQL 展示接口之间的对应关系：
+\begin{lstlisting}[caption={类型值上的查询与索引调用示例},label={lst:prototype-sql},numbers=none]
+CREATE INDEX orders_doc_gin
+ON orders USING gin (doc gin_compactxml_ops);
+
+SELECT xml_exists(doc, '/orders/order/item/name')
+FROM orders;
+
+SELECT xml_get(doc, '/orders/order/item/name')
+FROM orders;
+
+SELECT * FROM orders WHERE doc @> '鼠标'::text;
+\end{lstlisting}
+这里假定表 \texttt{orders} 的 \texttt{doc} 列采用原型压缩类型。对贯穿示例，前两条查询分别返回 true 和“机械键盘”；内容条件“鼠标”映射为值 ID 5，GIN 查找相应倒排项，候选确认后返回该订单所在行。是否选择索引路径，由执行器结合查询与代价估计决定。
+
+在这一过程中，路径和值在写入时被识别并转换为 ID，查询条件通过同一字典转换为对应 ID，索引则从已有内容记录中提取这些 ID。因此，压缩存储、查询和索引构建可以复用编码时生成的信息。
+
+\section{查询代价分析}
+\subsection{文档内访问代价}
+
+设目标文档有 $P$ 个路径条目、$N$ 条内容记录，查询字符串长度为 $|x|$。字典查找包括查询字符串哈希、必要的键比较和运行时字典访问，其成本记为 $T_{\Delta}(x)$。以下比较次数基于对象及所需字典已可访问的条件，读取、解包和运行时字典准备另行计量。
+
+路径存在判断在标识映射后执行二分查找，成本为 $T_{\Delta}(p)+O(\log P)$。路径首值提取还需顺序解码至首个匹配位置，最坏为 $T_{\Delta}(p)+O(\log P+N)$，并承担文本反查与输出成本。
+
+短值内容查询在字典命中后执行 $k$ 次 Bloom 探测；设摘要通过概率为 $\pi$，通过后的平均扫描记录数为 $\bar n$，单个文档的查询开销可表示为
 \[
-4+32+(4+8\times7)+12+0+136+(4+20)=268\text{ B}.
+T_{\mathrm{short}}=T_{\Delta}(t)+T_{\mathrm{summary}}+O(k)+\pi O(\bar n).
 \]
-这个数值只用于展示各区段如何共同构成一个压缩值；实际数据库 relation 还会包含行头、对齐、TOAST、索引页和共享字典等开销。
+其中 $T_{\mathrm{summary}}$ 包括摘要读取和原型中的位数组准备。字典未命中、Bloom Filter 判定不匹配和内容扫描未命中，分别使查询在不同阶段结束；通过 Bloom Filter 检查后，最坏需要扫描 $N$ 条记录。关闭 Bloom 时则直接执行内容扫描。
 
-CXHeader 保存版本、标志、字典标识、总长度及相关区段偏移。当前字段名沿用兼容布局：$\texttt{content\_offset}$ 指向路径索引区起始位置，$\texttt{path\_index\_offset}$ 指向后续内容区起始位置，$\texttt{bloom\_offset}$ 指向 Bloom 区。内容区之后的内联区按需存在；结构流位于 Bloom 数据之后，可由版本和长度边界定位。
+长值查询进一步包括计算查询哈希、定位内联原文及完整值比较。原型通过解码内容流确定内联区起点，再顺序查找内联条目，因此该部分成本同时受内容记录数、内联条目数与比较字节数影响。这些步骤共同决定了当前长值表示的查询开销。
 
-将内容流保持为文档序有两个原因：解码时可按原顺序消费叶记录；路径取值查询可返回文档序上的首个匹配值。相应代价是路径索引仅记录每条路径对应的叶内容记录数，不保存可直接跳转到所有对应值的连续区间；同一路径内容可能交错出现，因此 $\texttt{xml\_get}$ 在路径确认后仍需扫描内容流。
+\subsection{候选规模与关系级访问代价}
 
-\section{字典复用与变长整数编码}
+设关系含 $d$ 份文档，候选集合为 $C(t)$。索引查询成本可分为查询键准备、倒排访问、候选行访问与必要复核：
+\[
+T_{\mathrm{index}}=T_{\mathrm{key}}+T_{\mathrm{posting}}
++\sum_{D\in C(t)}\left(T_{\mathrm{row}}(D)+T_{\mathrm{recheck}}(D)\right).
+\]
+候选较少时，索引可以集中访问相关行；候选比例较高时，倒排读取、回表及复核在总成本中的占比提高。长值哈希碰撞会增加候选，缓存状态与数据库页组织也会影响各项开销。
 
-对每个路径字符串，编码器查询路径字典得到 $\texttt{path\_id}$；对短文本值，编码器查询 token 字典得到 $\texttt{token\_id}$。同一作用域内重复字符串复用同一整数标识，路径和 token 使用不同字典，避免语义混淆。字典不仅服务压缩，也为查询提供字符串到 ID 的映射，并为 GIN 查询键保持一致的语义基础。
-
-路径和值标识在内容流中使用 Varint 序列化。Varint 以 7 位为一组编码整数，最高位用于指示是否还有后续字节。较小 ID 通常少于固定 32 位编码的字节数，解码器则顺序读取 $(\texttt{path\_id},\texttt{token\_id})$ 对。Varint 的作用是降低内容区 ID 表示的空间成本。
-
-当前原型对 UTF-8 字节长度小于 1,024 的 token 使用共享字典；达到或超过阈值的长 token 不进入短 token 全局字典，而写入当前文档内联区。长 token 的 ID 通过置高位的 32 位哈希产生，并与短 token ID 区分。若写入同一文档时两个不同长值发生冲突，当前实现拒绝该输入；跨文档冲突仍可能导致 GIN 产生额外候选，因此查询必须精确复核。路径字典自身也有容量和键长边界。
-
-共享字典不是零成本组件。当前 PostgreSQL 原型在共享内存中维护路径与 token 哈希表，并将字典持久化到数据目录下的独立文件；其空间应计入系统级评价。事务回滚可能在服务器运行期间留下未被已提交文档引用的字典项，因此本文不声称字典条目与数据行具有完整事务回滚语义。字典 ID 数值取决于注册顺序，也不保证不同实例中一致。这些生命周期事实属于当前原型实现边界，不应与中间标识复用的抽象方法原则混为一谈。
-
-\section{面向查询的辅助数据组织}
-
-\textbf{排序路径索引。} 编码器先为结构流中的所有节点路径建立索引项，包括只对应内部节点的路径；再统计叶内容流中各 $\texttt{path\_id}$ 的记录数作为 $\texttt{pair\_count}$，最后按 $\texttt{path\_id}$ 升序排列。因此，内部节点路径可以在索引中以 $\texttt{pair\_count}=0$ 表示，路径存在查询仍以索引项是否存在为准；$\texttt{pair\_count}$ 表示对应叶内容记录数量，不是路径节点总出现次数。该索引用于路径存在性判断，不直接提供对应内容区的连续偏移。
-
-\textbf{文档级 Bloom 元数据。} 编码器将文档中出现的 token ID 加入 Bloom Filter。内容查询可先检查过滤器；确定不存在时跳过精确内容扫描，可能存在时仍须遍历内容流。Bloom 元数据与文档值一起封装，减少维护独立外部摘要的一致性问题，但会增加每个文档的表示空间。
-
-\textbf{长 token 内联区。} 对超过短 token 阈值的文本，内联区保存哈希标识、字节长度和原始解析后文本字节。内容流保存对应哈希标识。查询先以哈希匹配候选，再由精确字符串比较确认；该区不是全局字典的一部分，也不能把哈希值本身视作精确 token 身份。
-
-\textbf{节点结构流。} 前序结构流将路径标识和子节点数写入压缩值，供解码过程恢复层次和顺序。结构流不参与 Bloom 判断，也不直接作为 GIN 内容键。路径索引减少单文档路径判断工作；Bloom 过滤减少某些单文档内容扫描；GIN 在跨文档层面定位 token 候选；结构流支持解码。它们围绕同一中间表示协作，最终收益由整体存储和查询实验决定。
-
-\section{压缩表示的解码与正确性约束}
-
-表示正确性首先要求编码和解码采用相同的版本、区段边界和字典映射。解码器应验证总长度、偏移顺序和记录数量，逐项读取路径和值标识，并利用节点结构序列将叶内容放回相应节点。对短 token，通过字典反查获得文本；对长 token，通过内联区查找哈希标识并读取原文。
-
-对符合原型输入约束的文档，若结构与内容编码使用一致的路径字典，短值字典在声明作用域内稳定，长值哈希候选始终经内联原文复核，且序列化长度和区段边界有效，则可逐项说明所定义操作的正确性：路径存在查询在包含所有节点路径的排序索引中查找目标路径 ID；精确内容查询先以 Bloom 排除确定不存在的标识，再扫描内容记录并比较完整 token；路径取值查询按文档序扫描与目标路径 ID 相同的首条记录；GIN 仅根据 token ID 形成候选，并由操作符复核处理哈希碰撞；解码则按前序结构流消费叶内容记录，恢复受支持语义中的节点边界、顺序和文本。该论证依赖前述不变量，并非对任意 XML 及任意损坏输入的形式化证明。
-
-在本文原型声明的输入条件下，期望保持以下不变量：内容序列中的叶记录顺序与解析后文档中的叶节点顺序一致；每个内容记录中的路径 ID 与 token 标识均能映射回编码时的路径和值；路径索引的 $\texttt{pair\_count}$ 与内容流中相应路径 ID 的记录数一致；Bloom 若返回“不存在”，目标 token 不在构造过滤器时的 token 集合中，阳性只表示候选；结构流中的节点与内容记录按约定顺序消费，最终恢复元素顺序、边界和文本。
-
-正确性比较包括元素顺序、层次边界和解析后的叶文本；不要求原始空白、实体拼写、属性顺序或字节序列完全一致。该性质由实现测试支持，有限测试不能替代对所有输入形式的证明。当前原型以 libxml 解析 UTF-8 文档，最大深度为 128，并拒绝属性、命名空间、文档类型定义（Document Type Definition, DTD）、注释、字符数据（CDATA）、处理指令、混合内容及部分文档级结构；该事实界定当前验证样本，不改变本文方法研究面向数据库 XML 压缩和索引复用的问题定位。
+无索引顺序查询则对访问到的行调用相应谓词，提前结束文档内判断主要减少每行数据的处理工作。索引构建需要读取内容记录并去重；当前排序去重实现对单文档的键整理最坏为 $O(N\log N)$，另有数据库索引写入与维护成本。编码复用减少的主要是查询和键抽取阶段对原始 XML 的再次解析及文本边界识别，实际收益由候选分布和执行路径共同决定。
 
 \section{本章小结}
 
-本章提出面向查询的压缩表示方法：解析阶段生成路径—文本记录和节点结构记录；编码阶段确定并复用路径和值 ID；再将这些 ID 组织为文档序内容、排序路径摘要、Bloom 元数据、长值内联区和结构流。方法的关键是这些中间标识能够跨压缩、查询和索引阶段保持一致语义；其代价包括辅助信息、字典空间及长值处理。下一章说明如何基于该表示执行查询，并保证候选验证的正确性。
+本章提出基于编码中间数据复用的 XML 查询处理方法。短值内容查询通过共享字典和内容 ID 完成精确匹配，Bloom 摘要提供提前排除；长值查询通过哈希定位与内联原文比较完成验证。路径存在利用排序条目，路径首值提取进一步使用文档序内容流，并按照规定返回重复路径的首值及空叶节点的文本。
+
+对于数据库索引查询，本文从压缩内容流提取值标识作为 GIN 键，查询条件使用相同字典生成对应的检索键，再通过一致性判断和必要的复核保证结果正确。PostgreSQL 原型将类型、共享字典、查询函数和操作类接入数据库执行。至此，编码阶段形成的信息贯穿存储、文档内查询和关系级索引，下一章通过既有实验评价其正确性、空间与查询代价。
