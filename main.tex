@@ -9,7 +9,7 @@
 \newcommand{\doi}[1]{DOI: \href{https://doi.org/#1}{\nolinkurl{#1}}}
 
 % 封面与学位信息：有“请核对/占位”的字段须在正式提交前核实。
-\Title{面向数据库 XML 类型的压缩与索引优化方法}{Compression and Indexing Optimization for XML Types in Databases}
+\Title{\texorpdfstring{面向数据库 XML 类型的\\压缩与索引优化方法}{面向数据库 XML 类型的压缩与索引优化方法}}{Compression and Indexing Optimization for XML Types in Databases}
 \Branch{工学}
 \Degree{Master of Electronic Information}
 \Department{软件学院}{School of Software}
@@ -20,7 +20,7 @@
 \Tutor{刘子鹏}{Liu Zipeng}{副教授}
 \Author{周志强}{Zhou Zhiqiang}
 \StudentID{ZF2421124}
-\CLC{TK16（请核对分类号）}
+\CLC{TP311.13}
 % 原 PDF 未提供日期，暂留空；请在正式提交前填写。
 \DateEnroll{}{}{}
 \DateGraduate{}{}{}
@@ -35,7 +35,7 @@
 
 其次，提出基于编码标识复用的查询处理方法。查询条件按同一字典转换为标识，通过整数比较完成路径存在判断、完整文本精确匹配和路径首值提取，并利用路径摘要和 Bloom 摘要减少访问。GIN 索引的键直接从压缩表示的内容流读取，无需重新解析 XML 或另存叶文本；长文本以哈希为键，候选通过内联原文复核。
 
-最后，本文在 PostgreSQL 中实现了原型，并使用实际业务 XML 数据进行了测试。结果表明，基于本文方法实现的XML类型，压缩文档的恢复结果和查询结果均与独立解析结果一致。对 1 万份文档的测试显示，本文方法每列平均占用的存储空间比原生 XML 少 20.17\%。对于相同的短文本精确匹配查询，把共享字典占用的空间也算在内后，本文方法的总存储开销比同时保存原始 XML、叶文本数组并建立倒排索引的方案少 34.38\%，查询延迟与对照方案接近。
+最后，本文在 PostgreSQL 中实现了原型，并使用实际业务 XML 数据进行了测试。结果表明，基于本文方法实现的 XML 类型，压缩文档的恢复结果和查询结果均与独立解析结果一致。对 1 万份文档的测试显示，本文方法每份文档的列值平均占用空间比原生 XML 少 20.17\%。对于相同的短文本精确匹配查询，把共享字典占用的空间也算在内后，本文方法的总存储开销比同时保存原始 XML、叶文本数组并建立倒排索引的方案少 34.38\%，查询延迟与对照方案接近。
 }{%
 XML data in databases must be compact and support path access and content retrieval. Repetition in XML comes mainly from tag paths and leaf text, and path repetition occurs largely across documents. However, the native XML type stores complete tags in every document, per-value compression exploits only repetition within a document and requires decompression before querying, and storing leaf text separately for indexing adds storage. This thesis therefore removes cross-document repetition with a shared dictionary and uses the encoding identifiers directly for querying and indexing.
 
