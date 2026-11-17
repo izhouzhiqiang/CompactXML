@@ -2,140 +2,275 @@
 \chapter{面向查询的 XML 结构感知压缩方法}
 \label{chap:representation}
 
-数据库 XML 类型的压缩优化既要减少重复信息，也要保留查询所需的数据。XML 解析可以得到元素路径、文本值和节点关系，将这些信息组织为统一的编码记录，既能用于压缩存储，也能用于后续查询。本章从 XML 的重复特征及访问需求出发，提出面向查询的结构感知压缩表示方法，依次阐述中间记录生成、字典标识编码、二进制组织、结构恢复与空间代价。编码过程中形成的路径和值标识作为后续查询与索引处理的共同依据，其具体使用方法在第四章展开。
+数据库 XML 类型的压缩优化既要减少重复信息，也要保留查询所需的数据。本章首先结合示例和实验数据分析 XML 重复信息的分布及现有存储方式的不足，归纳压缩表示的设计目标；随后对压缩表示问题进行形式化定义，给出方法的总体框架；在此基础上依次阐述文档的序列分解、字典标识编码、二进制存储格式、解码恢复及其正确性，最后分析表示的空间代价。编码过程中形成的路径标识和值标识同时用于第四章的查询处理和索引键抽取。
 
-\section{问题分析与方法要求}
-\subsection{XML 重复信息的来源}
+\RestyleAlgo{ruled}
+\LinesNumbered
+\SetAlgoNoEnd
+\SetKwInput{KwIn}{输入}
+\SetKwInput{KwOut}{输出}
 
-XML 中的重复信息主要来自路径、文本值以及结构组织三个方面。路径重复表现为同类业务字段反复使用相同的标签和祖先序列；值重复表现为不同节点具有相同的完整文本；结构重复则表现为记录容器及其子节点组合多次出现。这三类重复分别影响路径字符串、文本值和节点关系的存储开销。
+\section{问题分析}
+\label{sec:rep-analysis}
 
-以第二章代码~\ref{lst:foundation-xml} 的订单文档为例，两个商品节点共享 \texttt{/orders/order/item} 路径，其名称和数量也分别共享相同的叶路径。该文档共有 10 个元素节点、7 种不同路径和 6 条叶文本记录。示例的 6 个文本值各不相同，因而主要体现路径及结构重复；在包含相同商品名称或状态的文档集合中，文本字典还可以进一步复用已有值标识。
+XML 文档的重复信息来自元素路径、叶文本和记录结构三个方面。为说明这些重复的具体形态，图~\ref{fig:rep-redundancy} 给出两份订单文档。$D_1$ 即第二章代码~\ref{lst:foundation-xml} 的订单，$D_2$ 是同一业务系统产生的另一份订单。为便于统计字节数，两份文档均写成不含排版空白的紧凑形式，图中按缩进排版。
 
-根据上述分析，编码需要满足两项要求：以可复用标识表示重复出现的路径和值，同时以独立记录保存各节点的出现次序和结构关系。前者减少重复字符串的存储，后者为结构恢复与查询解释提供依据。
+% 黑白打印时依靠线型和字重区分：文档内重复路径用下划线，跨文档重复路径用加粗，跨文档重复叶文本用灰底。
+\newcommand{\intra}[1]{\textcolor{blue!75!black}{\underline{#1}}}
+\newcommand{\cross}[1]{\textcolor{teal!80!black}{\textbf{#1}}}
+\newcommand{\crossv}[1]{{\setlength{\fboxsep}{1pt}\colorbox{black!15}{\textcolor{orange!85!black}{\textbf{#1}}}}}
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  doc/.style={draw,rounded corners=2pt,align=left,font=\small,inner sep=6pt,anchor=north west},
+  lab/.style={font=\small,anchor=south west}]
+\node[lab] at (0,0.05) {(a) 文档 $D_1$};
+\node[doc,text width=6.4cm] (d1) at (0,0) {%
+<orders>\\
+\hspace*{1em}<order>\\
+\hspace*{2em}<id>1001</id>\\
+\hspace*{2em}<customer>张三</customer>\\
+\hspace*{2em}<item>\\
+\hspace*{3em}<name>机械键盘</name>\\
+\hspace*{3em}<quantity>2</quantity>\\
+\hspace*{2em}</item>\\
+\hspace*{2em}\intra{<item>}\\
+\hspace*{3em}\intra{<name>}鼠标\intra{</name>}\\
+\hspace*{3em}\intra{<quantity>}1\intra{</quantity>}\\
+\hspace*{2em}\intra{</item>}\\
+\hspace*{1em}</order>\\
+</orders>};
+\node[lab] at (7.2,0.05) {(b) 文档 $D_2$};
+\node[doc,text width=6.4cm] (d2) at (7.2,0) {%
+\cross{<orders>}\\
+\hspace*{1em}\cross{<order>}\\
+\hspace*{2em}\cross{<id>}1002\cross{</id>}\\
+\hspace*{2em}\cross{<customer>}李四\cross{</customer>}\\
+\hspace*{2em}\cross{<item>}\\
+\hspace*{3em}\cross{<name>}\crossv{鼠标}\cross{</name>}\\
+\hspace*{3em}\cross{<quantity>}\crossv{1}\cross{</quantity>}\\
+\hspace*{2em}\cross{</item>}\\
+\hspace*{1em}\cross{</order>}\\
+\cross{</orders>}};
+\node[font=\small,align=left,anchor=north west,text width=13.6cm] at ([yshift=-6pt]d1.south west) {%
+\intra{蓝色下划线}：文档内重复的路径，第二个 \texttt{item} 的 3 条路径已在第一个 \texttt{item} 中出现\\
+\cross{青色加粗}：跨文档重复的路径，$D_2$ 的 7 条元素路径全部在 $D_1$ 中出现\\
+\crossv{橙色灰底}：跨文档重复的叶文本，“鼠标”和“1”在 $D_1$ 中已出现};
+\end{tikzpicture}
+\caption{两份订单文档中的路径重复和叶文本重复}
+\label{fig:rep-redundancy}
+\end{figure}
 
-\subsection{压缩表示需要保留的信息}
+表~\ref{tab:rep-example-count} 统计了两份文档的组成。$D_1$ 的 186 B 中，标签标记占 156 B，叶文本只占 30 B；$D_2$ 的标签标记占 109 B，比例同样超过 80\%。从路径看，$D_1$ 的 10 个元素节点只对应 7 条不同路径，两个 \texttt{item} 节点及其子节点使用相同的标签序列；$D_2$ 的 7 个元素节点没有引入任何新路径。从文本看，$D_2$ 的 4 个叶文本中有 2 个已在 $D_1$ 中出现。上述统计表明，序列化文本的大部分字节用于反复书写相同的标签，而这些标签所表达的路径集合很小。
 
-路径表示节点在文档层次中的位置，同一路径可以对应多个实际节点。同一路径出现多次时，各节点所属的容器及文档顺序决定了字段之间的关联。因此，叶路径与文本序列适合描述内容出现情况，完整层次的恢复还需要节点边界信息。
-
-例如，以下两种结构具有相同的叶路径与文本序列：
-\begin{lstlisting}[caption={具有相同叶内容序列的两种容器组织},numbers=none]
-<r><a><b>1</b><b>2</b></a></r>
-<r><a><b>1</b></a><a><b>2</b></a></r>
-\end{lstlisting}
-两者的内容记录均为 \texttt{(/r/a/b,1)}、\texttt{(/r/a/b,2)}，差异在于 \texttt{a} 的出现次数及子节点边界。若为每个节点记录路径和直接子节点数，再按前序组织记录，这一差异即可显式保存。
-
-本文据此分别组织内容序列与结构序列：内容序列保留叶文本及文档顺序，结构序列保留所有元素节点及其直接子节点数。两个序列以叶节点的出现顺序和路径标识相互对应，形成结构与内容的联合表示。
-
-\subsection{查询需求对编码组织的影响}
-
-路径存在、内容匹配、路径取值和文档恢复对表示提出了不同要求，如表~\ref{tab:representation-requirements} 所示。将这些要求落实到编码过程，可以使查询直接使用已识别的信息。
 \begin{table}[htbp]
 \centering\small
-\caption{目标操作与编码信息的对应关系}
-\label{tab:representation-requirements}
-\begin{tabular}{p{0.16\linewidth}p{0.34\linewidth}p{0.39\linewidth}}
+\caption{图~\ref{fig:rep-redundancy} 中两份文档的组成统计}
+\label{tab:rep-example-count}
+\begin{tabular}{lrrr}
 \toprule
-目标操作 & 所需信息 & 表示要求 \\
+统计项 & $D_1$ & $D_2$ & 两份合计 \\
 \midrule
-路径存在 & 文档中出现的元素路径 & 包含内部节点与叶节点的路径集合 \\
-精确内容匹配 & 叶文本的完整值 & 一致的值标识，以及长值的原文验证依据 \\
-路径首值提取 & 路径与叶文本的对应关系 & 文档序内容记录及值反查能力 \\
-结构恢复 & 标签、子节点边界和顺序 & 前序结构记录与对应的叶内容记录 \\
+紧凑序列化字节数（B） & 186 & 126 & 312 \\
+其中标签标记字节数（B） & 156 & 109 & 265 \\
+元素节点数 & 10 & 7 & 17 \\
+不同元素路径数 & 7 & 7 & 7 \\
+叶文本出现次数 & 6 & 4 & 10 \\
+不同叶文本数 & 6 & 4 & 8 \\
 \bottomrule
 \end{tabular}
 \end{table}
-路径集合可以由结构记录派生，内容摘要可以由值标识派生，关系级索引键也可以从同一内容序列提取。由此，编码阶段既形成紧凑表示，也形成查询与索引可继续利用的信息基础。
 
-\section{方法总体框架}
-\subsection{输入、输出与语义约定}
+示例中的重复在实际业务数据中更为明显。对第五章使用的 10,000 份业务 XML 文档重新扫描，统计结果如表~\ref{tab:rep-dataset-count} 所示。单份文档平均包含 261.8 个元素节点和 137.0 条不同路径，文档内的路径重复约为 1.9 倍；但全部文档合计只有 313 条不同路径，各文档不同路径数之和为 1,369,742，即每条路径平均在约 4,376 份文档中出现。叶文本方面，单份文档平均有 129.5 个非空叶文本，其中不同值 29.1 个；各文档不同值数量之和为 290,706，而整个集合只有 150,922 个不同非空值。由此可知，路径重复主要发生在文档之间，叶文本在文档内部和文档之间都存在明显重复。
 
-设输入 XML 为 $D$，路径字典与短文本字典分别为 $\Delta_p$ 和 $\Delta_v$。编码器输出二进制对象 $B_D$，其中保存路径辅助区、内容流、长值内联区、Bloom 摘要及结构流。共享字典单独保存，解码与查询使用编码时对应的字典解释对象中的标识。
-
-本文以解析后的元素树作为表示对象，恢复目标包括元素名称、父子关系、同级顺序及叶文本。恢复时允许排版空白、实体引用的写法和空元素的书写形式与原文不同。对于空叶元素，结构序列保存该元素，内容序列保存其空字符串值。
-
-原型通过元素与叶文本组成的 XML 文档验证该方法，采用 UTF-8 字节长度划分短值和长值。输入检查对属性、命名空间、DTD、注释、CDATA、处理指令及混合内容设置限制，递归深度上限设为 128。上述实现条件集中规定原型的表示对象，后续编码、恢复和查询均采用相同约定。
-
-\subsection{编码流程与信息复用关系}
-
-方法流程如图~\ref{fig:representation-pipeline} 所示。解析器首先构造元素树，随后一次前序遍历生成结构记录和文档序内容记录；编码器为路径与文本分配标识，分别编码内容和结构，并派生辅助访问数据。路径标识贯穿结构、内容及路径辅助区，值标识贯穿内容、Bloom 摘要及后续索引键抽取。
-\begin{figure}[htbp]
-\centering
-\begin{tikzpicture}[box/.style={draw,rounded corners=2pt,align=center,font=\small,inner sep=5pt},flow/.style={-{Stealth[length=1.8mm]},thick}]
-\node[box,text width=8.5cm] (input) at (0,0) {XML 解析与前序遍历：识别路径、叶文本和子节点关系};
-\node[box,text width=4.5cm] (content) at (-2.9,-1.3) {文档序内容记录\\路径与文本关联};
-\node[box,text width=4.5cm] (structure) at (2.9,-1.3) {前序结构记录\\路径与子节点数};
-\node[box,text width=9.3cm] (ids) at (0,-2.7) {一致的字典标识\\路径 ID 与值 ID；长值保留内联原文};
-\node[box,text width=4.5cm] (streams) at (-2.9,-4.1) {内容流与结构流\\变长整数编码};
-\node[box,text width=4.5cm] (aux) at (2.9,-4.1) {派生辅助数据\\排序路径条目与 Bloom 摘要};
-\node[box,text width=9.3cm] (binary) at (0,-5.5) {统一二进制对象\\支持恢复、文档内访问及关系级索引键抽取};
-\draw[flow] (input)--(content);\draw[flow] (input)--(structure);
-\draw[flow] (content)--(ids);\draw[flow] (structure)--(ids);
-\draw[flow] (ids)--(streams);\draw[flow] (ids)--(aux);
-\draw[flow] (streams)--(binary);\draw[flow] (aux)--(binary);
-\end{tikzpicture}
-\caption{结构感知编码与中间数据复用的总体流程}
-\label{fig:representation-pipeline}
-\end{figure}
-代码~\ref{lst:encode-reuse} 给出编码过程。路径辅助区首先登记所有节点路径，再统计各路径关联的叶内容记录数，使内部路径也具有存在性信息。
-\begin{lstlisting}[caption={结构感知编码过程},label={lst:encode-reuse},numbers=none]
-Encode(D, Delta_p, Delta_v):
-    tree <- ParseAndValidate(D)
-    (R, T) <- CollectInPreorder(tree)
-    E <- []; S <- []; Counts <- {}; Inline <- {}
-    for (path, children) in T:
-        pid <- LookupOrAssign(Delta_p, path)
-        Counts[pid] <- 0
-        Append(S, (pid, children))
-    F <- NewBloomFilter(size(R))
-    for (path, value) in R:
-        pid <- Lookup(Delta_p, path)
-        if ByteLengthUTF8(value) < 1024:
-            vid <- LookupOrAssign(Delta_v, value)
-        else:
-            vid <- TaggedHash(value)
-            CheckLocalCollision(Inline, vid, value)
-            Inline[vid] <- value
-        Append(E, (pid, vid))
-        Counts[pid] <- Counts[pid] + 1
-        BloomInsert(F, vid)
-    P <- SortByPathID(Counts)
-    return Serialize(P, Varint(E), Inline, F, Varint(S))
-\end{lstlisting}
-编码复用建立在相同字符串与相同标识的稳定对应上。压缩阶段保存标识，查询阶段将条件转换为同一标识，索引构建阶段从内容流取得该标识。相应成本由原始 XML 的重复解析，转化为已有编码记录的读取、解码和使用。
-
-\section{XML 结构与内容的中间表示}
-\subsection{解析与路径生成}
-
-遍历过程中维护从根到当前节点的标签序列。访问元素时，将其名称加入路径；返回父节点时恢复上一级路径。对每个元素记录完整路径与直接元素子节点数，对叶元素另外记录解析后的完整文本值。完整路径用于标识结构类别，前序位置用于保留节点实例的出现顺序。
-
-代码~\ref{lst:encoding-xml-example} 列出与第二章一致的订单示例，后续记录表、标识序列与布局计算均以该文档为输入。
-\begin{lstlisting}[caption={结构感知编码的订单 XML 输入},label={lst:encoding-xml-example},numbers=none]
-<orders>
-  <order>
-    <id>1001</id>
-    <customer>张三</customer>
-    <item><name>机械键盘</name><quantity>2</quantity></item>
-    <item><name>鼠标</name><quantity>1</quantity></item>
-  </order>
-</orders>
-\end{lstlisting}
-
-对贯穿示例，前序访问顺序为根元素、订单元素、编号、客户、第一个商品及其名称和数量、第二个商品及其名称和数量。同一路径可以在遍历序列中多次出现，各次出现对应独立节点。
-
-\subsection{文档序内容记录}
-
-设文档含 $N$ 个叶元素，内容序列定义为
-\[
-R_D=\langle(p_1,v_1),\ldots,(p_N,v_N)\rangle,
-\]
-其中 $p_i$ 为叶路径，$v_i$ 为解析后的叶文本，序列顺序与文档顺序一致。订单文档得到表~\ref{tab:encoding-content} 所示记录。
 \begin{table}[htbp]
 \centering\small
-\caption{订单 XML 的文档序内容记录}
+\caption{10,000 份业务 XML 文档的重复统计}
+\label{tab:rep-dataset-count}
+\begin{tabular}{lrrr}
+\toprule
+统计项 & 单文档平均 & 各文档之和 & 整个集合 \\
+\midrule
+元素节点数 & 261.8 & 2,618,407 & 2,618,407 \\
+不同元素路径数 & 137.0 & 1,369,742 & 313 \\
+非空叶文本出现次数 & 129.5 & 1,295,381 & 1,295,381 \\
+不同非空叶文本数 & 29.1 & 290,706 & 150,922 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+在这一数据特征下，数据库中常用的三种 XML 存储方式各有不足。
+
+（1）\textbf{原生 XML 类型。} PostgreSQL 的 \texttt{xml} 类型以文本形式保存每份文档，元素名在开始标签和结束标签中各写一次\cite{pg16xmltype}。跨文档重复的路径因此在每份文档中重新出现，表~\ref{tab:rep-example-count} 中占比超过 80\% 的标签字节无法被共享。执行 XPath 时，数据库需要对每个文档值调用 libxml2 重新解析文本\cite{pg16xmlfunc}。
+
+（2）\textbf{对单个值的通用压缩。} TOAST 对较大的变长值进行压缩\cite{pg16toast}，应用也可以将 XML 用 zlib 或 zstd 压缩后存为 \texttt{bytea}。这类方法以单个值为压缩单位，只能利用文档内部的重复；表~\ref{tab:rep-dataset-count} 中占主导的跨文档路径重复不在其处理范围内。此外，压缩结果不能被查询直接解释，每次查询都需要先解压，再解析 XML。
+
+（3）\textbf{保留原文并另存叶文本建立索引。} 为支持内容检索，可以在保留 XML 原文的同时，提取叶文本形成数组列并建立 GIN 索引。这一方式为内容查询提供了直接入口，但叶文本在原文和数组中各保存一份，索引键也需要从原文中重新提取。存储开销不仅没有减少，反而因辅助数据而增加。
+
+此外，若只保存叶路径和文本序列，还会丢失容器边界。以下两份文档的叶路径和文本序列完全相同：
+\begin{lstlisting}[caption={具有相同叶内容序列的两种容器组织},label={lst:rep-boundary},numbers=none]
+<r><a><b>1</b><b>2</b></a></r>
+<r><a><b>1</b></a><a><b>2</b></a></r>
+\end{lstlisting}
+两者的叶内容均为 \texttt{(/r/a/b,1)}、\texttt{(/r/a/b,2)}，差异仅在于元素 \texttt{a} 的出现次数及其子节点范围。按路径分组的容器压缩若不保存节点边界，就无法区分这两份文档。
+
+综合上述分析，本文的压缩表示需要达到四个设计目标，它们与现有方式的不足及本章设计的对应关系如表~\ref{tab:rep-goals} 所示。
+
+\begin{table}[htbp]
+\centering\small
+\caption{现有方式的不足、设计目标与本章设计的对应关系}
+\label{tab:rep-goals}
+\begin{tabular}{p{0.30\linewidth}p{0.30\linewidth}p{0.30\linewidth}}
+\toprule
+现有方式的不足 & 设计目标 & 本章对应设计 \\
+\midrule
+路径和叶文本在每份文档中以字符串形式重复保存 & G1：跨文档共享路径和叶文本的存储 & 共享路径字典和值字典，文档内只保存整数标识 \\
+压缩结果须解压并解析后才能查询 & G2：在压缩表示上直接判断路径和内容条件 & 按文档顺序保存标识序列，并附加路径区和 Bloom 区 \\
+索引键来自另存的叶文本 & G3：索引键直接取自压缩表示 & 从内容流读取值标识作为 GIN 键 \\
+只保存叶内容会丢失容器边界 & G4：恢复原有元素树 & 前序结构序列记录每个元素的子节点数 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+其中，G1 决定表示的空间开销，G2 和 G3 决定表示能否被查询和索引直接使用，G4 保证表示可以替代原文作为唯一的存储形式。下一节将这四个目标表述为形式化的约束和优化目标。
+
+\section{问题定义}
+\label{sec:rep-definition}
+
+本节先定义本章处理的文档模型、文档等价关系和目标查询操作，再给出压缩表示问题的输入、输出和约束。记 $\Sigma^{*}$ 为全部 UTF-8 字节串的集合，$|s|$ 为字节串 $s$ 的字节长度。
+
+\begin{definition}[XML 文档]
+\label{def:rep-document}
+一份 XML 文档表示为有序标号树 $D=(V,E,r,\lambda,\prec,\mathrm{val})$。其中，$V$ 为元素节点集合，$E\subseteq V\times V$ 为父子边集合，$r\in V$ 为根元素；$\lambda:V\to\Sigma^{*}$ 给出元素名；$\prec$ 是同一父节点下子元素的先后顺序；没有子元素的节点称为叶元素，其集合记为 $L(D)$，$\mathrm{val}:L(D)\to\Sigma^{*}$ 给出叶元素的文本值，空元素的文本值为空串。
+\end{definition}
+
+对任一节点 $v$，设从根到 $v$ 的节点序列为 $r=u_0,u_1,\ldots,u_k=v$，定义其路径
+\[
+\mathrm{path}(v)=/\lambda(u_0)/\lambda(u_1)/\cdots/\lambda(u_k).
+\]
+文档中出现的全部路径记为 $P(D)=\{\mathrm{path}(v)\mid v\in V\}$。例如，在 $D_1$ 中，两个商品名称节点的路径都是 \texttt{/orders/order/item/name}，$|P(D_1)|=7$。
+
+\begin{definition}[文档等价]
+\label{def:rep-equivalence}
+对文档 $D$ 和 $D'$，若存在双射 $f:V\to V'$，满足 $f(r)=r'$，且对任意节点 $u,v$ 有：$(u,v)\in E$ 当且仅当 $(f(u),f(v))\in E'$；$\lambda(v)=\lambda'(f(v))$；$u\prec v$ 当且仅当 $f(u)\prec' f(v)$；对叶元素 $v$ 有 $\mathrm{val}(v)=\mathrm{val}'(f(v))$，则称 $D$ 与 $D'$ 等价，记为 $D\equiv D'$。
+\end{definition}
+
+定义~\ref{def:rep-equivalence} 规定了本文的信息保留要求：元素名、父子关系、兄弟顺序和叶文本必须保持不变；排版空白、实体引用的写法、空元素的书写形式等不影响等价。代码~\ref{lst:rep-boundary} 中的两份文档元素数量不同，因此不等价。
+
+\begin{definition}[目标查询]
+\label{def:rep-queries}
+对文档 $D$、路径 $p$ 和非空字节串 $t$，定义三类操作：
+\begin{itemize}
+\item $\operatorname{EXISTS}(D,p)$：当且仅当 $p\in P(D)$ 时为真；
+\item $\operatorname{CONTAINS}(D,t)$：当且仅当存在 $v\in L(D)$ 使 $\mathrm{val}(v)=t$ 时为真；
+\item $\operatorname{GET}(D,p)$：按文档顺序返回第一个满足 $\mathrm{path}(v)=p$ 的叶元素 $v$ 的文本 $\mathrm{val}(v)$，不存在时返回空值。
+\end{itemize}
+\end{definition}
+
+三类操作分别对应 XPath 中的路径存在判断、叶文本相等判断和路径取值，第四章将给出它们与 PostgreSQL 原生 XML 函数的对应关系。在上述定义的基础上，本章研究的问题表述如下。
+
+\textbf{问题（面向查询的 XML 压缩表示）。} 输入为文档集合 $\mathcal{D}=\{D_1,\ldots,D_d\}$。输出包括两部分：一是共享字典 $\Delta=(\Delta_p,\Delta_v)$，分别保存路径和短文本到整数标识的映射；二是每份文档的编码对象 $B_{D_i}=\mathrm{enc}(D_i,\Delta)$，它是一个字节串，作为数据库列值保存。同时需要给出解码函数 $\mathrm{dec}$、查询函数 $\hat Q$ 和键抽取函数 $K$，使下列约束成立：
+\begin{enumerate}[label=（C\arabic*）]
+\item \textbf{可恢复：} 对任意 $D\in\mathcal{D}$，$\mathrm{dec}(B_D,\Delta)\equiv D$；
+\item \textbf{可直接查询：} 对 $Q\in\{\operatorname{EXISTS},\operatorname{CONTAINS},\operatorname{GET}\}$ 及其参数 $x$，$\hat Q(B_D,\Delta,x)=Q(D,x)$，且计算过程不重建元素树；
+\item \textbf{索引键完备：} $K(B_D)$ 是从 $B_D$ 读出的整数集合，并存在查询键函数 $\kappa$，使得 $\operatorname{CONTAINS}(D,t)$ 为真时 $\kappa(t)\in K(B_D)$。
+\end{enumerate}
+在满足上述约束的前提下，目标是减小持久化存储总量
+\begin{equation}
+S(\mathcal{D})=|\Delta|+\sum_{i=1}^{d}|B_{D_i}|.
+\label{eq:rep-objective}
+\end{equation}
+
+约束（C1）至（C3）分别对应设计目标 G4、G2 和 G3，目标函数~\eqref{eq:rep-objective} 对应 G1。其中，$|\Delta|$ 被全部文档分摊，因此共享字典使跨文档重复的路径和文本只需保存一次。式~\eqref{eq:rep-objective} 表明了设计取向，本章通过共享字典和变长整数编码减小该值，并不求解其理论最优解。（C3）只要求真实匹配的文档一定出现在候选中，即索引不漏检；候选中的多余文档由第四章的复核步骤排除。
+
+本章方法的适用范围如下：输入为仅包含元素和叶文本的 XML 文档，不处理属性、命名空间、DTD、注释、CDATA、处理指令和混合内容，元素嵌套深度不超过 128。叶文本按 UTF-8 字节长度以阈值 $\tau=1024$ B 划分为短值和长值，短值进入共享值字典，长值保存在文档内。第五章的业务数据满足上述范围。
+
+\section{方法总体框架}
+\label{sec:rep-framework}
+
+方法的总体框架如图~\ref{fig:representation-pipeline} 所示，编码过程依次为解析、文档分解、字典标识编码和二进制组织四个步骤，生成的编码对象供解码恢复、文档内查询和索引键抽取使用。图中每个步骤给出订单文档 $D_1$ 的部分中间结果。
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  box/.style={draw,rounded corners=2pt,align=flush center,font=\small,inner sep=4pt},
+  cell/.style={draw,fill=black!5,minimum height=0.8cm,minimum width=1.9cm,font=\small,inner sep=1pt},
+  flow/.style={-{Stealth[length=1.8mm]},thick},
+  use/.style={-{Stealth[length=1.6mm]},dashed}]
+\node[box,text width=11.4cm] (xml) at (0,0) {输入：XML 文档 $D$，共享字典 $\Delta=(\Delta_p,\Delta_v)$};
+\node[box,text width=11.4cm] (tree) at (0,-1.3) {解析：得到元素树（元素名、父子关系、兄弟顺序、叶文本）};
+\node[box,text width=5.3cm] (R) at (-3.05,-3.15) {内容序列 $R_D$：每个叶元素一项\\（路径，文本）\\[2pt]
+  {\scriptsize\ttfamily (/orders/order/id, 1001)}\\{\scriptsize\ttfamily (/orders/order/customer, 张三) \ldots}};
+\node[box,text width=5.3cm] (T) at (3.05,-3.15) {结构序列 $T_D$：每个元素一项\\（路径，子节点数）\\[2pt]
+  {\scriptsize\ttfamily (/orders, 1)\quad(/orders/order, 4)}\\{\scriptsize\ttfamily (/orders/order/id, 0) \ldots}};
+\node[box,text width=11.4cm] (dict) at (0,-5.0) {字典映射：路径 $\to$ 路径 ID；短文本 $\to$ 值 ID；长文本 $\to$ 哈希标识};
+\node[box,text width=5.3cm] (E) at (-3.05,-6.35) {整数对序列 $E_D$\\{\scriptsize\ttfamily (3,1)\ (4,2)\ (6,3)\ (7,4)\ \ldots}};
+\node[box,text width=5.3cm] (S) at (3.05,-6.35) {整数对序列 $S_D$\\{\scriptsize\ttfamily (1,1)\ (2,4)\ (3,0)\ (4,0)\ \ldots}};
+\foreach \n/\t/\x in {h/表示头/-4.75,pa/路径区/-2.85,cs/内容流/-0.95,il/长值区/0.95,bf/Bloom 区/2.85,st/结构区/4.75}{
+  \node[cell] (\n) at (\x,-8.3) {\t};}
+\node[font=\small,anchor=west] at (5.8,-8.3) {$B_D$};
+\draw[flow] (xml)--(tree);
+\draw[flow] (tree.south-|R)--node[left,font=\scriptsize]{前序遍历}(R);
+\draw[flow] (tree.south-|T)--node[right,font=\scriptsize]{前序遍历}(T);
+\draw[flow] (R)--(R|-dict.north);
+\draw[flow] (T)--(T|-dict.north);
+\draw[flow] (dict.south-|E)--(E);
+\draw[flow] (dict.south-|S)--(S);
+\foreach \c in {pa,cs,il,bf} \draw[flow] (E.south)--(\c.north);
+\draw[flow] (S.south)--(st.north);
+\node[box,text width=3.6cm] (u1) at (-3.95,-10.2) {解码恢复（\ref{sec:rep-decode} 节）\\读结构区、内容流、长值区};
+\node[box,text width=3.6cm] (u2) at (0,-10.2) {文档内查询（第四章）\\读路径区、Bloom 区、内容流、长值区};
+\node[box,text width=3.6cm] (u3) at (3.95,-10.2) {GIN 键抽取（第四章）\\读内容流中的值 ID};
+\foreach \u in {u1,u2,u3} \draw[use] (\u|-h.south)--(\u.north);
+\end{tikzpicture}
+\caption{结构感知压缩方法的总体框架（以订单文档 $D_1$ 为例）}
+\label{fig:representation-pipeline}
+\end{figure}
+
+\textbf{（1）解析。} 编码器使用 XML 解析器读取文档，检查其是否属于上节规定的适用范围，并得到元素树。
+
+\textbf{（2）文档分解（\ref{sec:rep-decompose} 节）。} 对元素树做一次前序遍历，生成两条序列：内容序列 $R_D$ 按文档顺序记录每个叶元素的路径和文本，用于内容查询和路径取值；结构序列 $T_D$ 按前序记录每个元素的路径和子节点数，用于保存容器边界。两条序列共同满足约束（C1）。
+
+\textbf{（3）字典标识编码（\ref{sec:rep-dictionary} 节）。} 路径和短文本通过共享字典转换为整数标识，长文本转换为带标记的哈希标识。$R_D$ 和 $T_D$ 由此变为整数对序列 $E_D$ 和 $S_D$。这一步消除了跨文档重复的字符串，对应目标 G1；同时，查询常量可以用同一字典转换为标识，使查询在整数上进行。
+
+\textbf{（4）二进制组织（\ref{sec:rep-binary} 节）。} $E_D$ 和 $S_D$ 采用变长整数编码，分别写入内容流和结构区；长值原文写入长值区。路径区和 Bloom 区不需要再次读取原文，而是在生成 $E_D$ 时同步统计得到：路径区记录文档中出现的全部路径及其叶记录数，Bloom 区记录全部值标识的成员摘要。各区段连接为一个字节串 $B_D$。
+
+图~\ref{fig:representation-pipeline} 底部列出了使用 $B_D$ 的三类处理。解码器读取结构区和内容流恢复元素树，满足（C1）；文档内查询利用路径区判断路径是否存在，利用 Bloom 区排除不含目标值的文档，再在内容流中比较标识，满足（C2）；GIN 键抽取直接读出内容流中的值 ID，满足（C3）。三类处理读取的都是编码阶段写入的同一组标识，查询和索引无需再次解析 XML 原文。这正是本文所说的编码中间数据复用：编码时为压缩而生成的标识和记录，直接作为查询与索引的数据来源。
+
+在整个流程中，标识的一致性是复用成立的前提。共享字典只追加新条目，已分配的标识不再改变，因此同一字符串在编码、查询和索引中总是对应同一个整数。完整的编码过程在给出二进制格式后以算法~\ref{alg:rep-encode} 描述。
+
+\section{文档的序列分解}
+\label{sec:rep-decompose}
+
+本节以代码~\ref{lst:foundation-xml} 的订单文档 $D_1$ 为贯穿示例，说明两条序列的定义及其生成方法。
+
+编码器对元素树做一次前序遍历，并维护从根到当前节点的标签栈。进入元素时将其名称压栈，栈中标签以“/”连接即为当前节点的路径；离开元素时将其弹出。对 $D_1$，前序访问顺序为：根元素 \texttt{orders}、\texttt{order}、\texttt{id}、\texttt{customer}、第一个 \texttt{item} 及其 \texttt{name} 和 \texttt{quantity}、第二个 \texttt{item} 及其 \texttt{name} 和 \texttt{quantity}。同一路径可以在遍历中多次出现，每次出现对应一个独立节点。遍历过程中同时生成以下两条序列。
+
+\begin{definition}[内容序列]
+\label{def:rep-content}
+设 $D$ 的叶元素按文档顺序为 $v_1,\ldots,v_N$，其内容序列定义为
+\[
+R_D=\langle(\mathrm{path}(v_1),\mathrm{val}(v_1)),\ldots,(\mathrm{path}(v_N),\mathrm{val}(v_N))\rangle.
+\]
+\end{definition}
+
+\begin{definition}[结构序列]
+\label{def:rep-structure}
+设 $D$ 的全部元素按前序为 $u_1,\ldots,u_M$，$c(u_j)$ 为 $u_j$ 的子元素个数，其结构序列定义为
+\[
+T_D=\langle(\mathrm{path}(u_1),c(u_1)),\ldots,(\mathrm{path}(u_M),c(u_M))\rangle.
+\]
+\end{definition}
+
+由于前序遍历中叶元素的相对次序与文档顺序一致，$T_D$ 中子节点数为 0 的项与 $R_D$ 的项按顺序一一对应。$D_1$ 有 $N=6$ 个叶元素和 $M=10$ 个元素，两条序列分别如表~\ref{tab:encoding-content} 和表~\ref{tab:preorder-node-records} 所示，表中的路径 ID 将在下一节说明。
+
+\begin{table}[htbp]
+\centering\small
+\caption{订单文档 $D_1$ 的内容序列 $R_D$}
 \label{tab:encoding-content}
 \begin{tabular}{cll}
 \toprule
-序号 & 完整路径 & 文本值 \\
+序号 & 叶元素路径 & 文本值 \\
 \midrule
 1 & \texttt{/orders/order/id} & 1001 \\
 2 & \texttt{/orders/order/customer} & 张三 \\
@@ -146,23 +281,14 @@ R_D=\langle(p_1,v_1),\ldots,(p_N,v_N)\rangle,
 \bottomrule
 \end{tabular}
 \end{table}
-内容流按上述顺序编码。对同一路径的多条记录，出现次序决定首值提取的结果；对整体恢复，该次序决定叶文本与结构叶节点的对应关系。
-
-\subsection{前序结构记录}
-
-设元素节点数为 $M$，结构序列定义为
-\[
-T_D=\langle(p^{s}_1,c_1),\ldots,(p^{s}_M,c_M)\rangle,
-\]
-其中 $p^{s}_j$ 为第 $j$ 个前序节点的路径，$c_j$ 为其直接元素子节点数。订单文档的根节点有 1 个子节点，订单有 4 个子节点，两个商品各有 2 个子节点，6 个叶节点的子节点数均为 0。
 
 \begin{table}[htbp]
 \centering\small
-\caption{订单文档的前序节点与结构记录}
+\caption{订单文档 $D_1$ 的结构序列 $T_D$}
 \label{tab:preorder-node-records}
 \begin{tabular}{clrr}
 \toprule
-前序位置 & 元素实例 & 路径 ID（见表~\ref{tab:xml-example-dictionary}） & 子节点数 \\
+前序位置 & 元素 & 路径 ID（见表~\ref{tab:xml-example-dictionary}） & 子节点数 \\
 \midrule
 1 & orders & 1 & 1 \\
 2 & order & 2 & 4 \\
@@ -178,15 +304,40 @@ T_D=\langle(p^{s}_1,c_1),\ldots,(p^{s}_M,c_M)\rangle,
 \end{tabular}
 \end{table}
 
-前序次序与子节点数共同确定有序树的节点边界：读取一个节点后，依次恢复其声明数量的子树，随后返回父节点。恢复每个叶节点时依次读取一条内容记录，空叶节点也对应一条空文本记录。由此，具有相同路径的重复容器仍能保持各自的子树范围。
+两条序列分工不同。$R_D$ 保存所有叶文本及其路径，且保持文档顺序，因此对同一路径的多个叶元素，序列中第一次出现的项就是 $\operatorname{GET}$ 的结果；$\operatorname{CONTAINS}$ 和 $\operatorname{GET}$ 只需顺序读取 $R_D$。$T_D$ 中，两个 \texttt{item} 的路径相同，但各自的前序位置和子节点数 2 规定了其子树范围，这正是只保存叶内容时丢失的信息。对代码~\ref{lst:rep-boundary} 的两份文档，两者的结构序列分别为
+\[
+\begin{aligned}
+&\langle(/r,1),(/r/a,2),(/r/a/b,0),(/r/a/b,0)\rangle,\\
+&\langle(/r,2),(/r/a,1),(/r/a/b,0),(/r/a,1),(/r/a/b,0)\rangle,
+\end{aligned}
+\]
+根元素的子节点数分别为 1 和 2，二者可以区分。
 
-\section{基于字典的标识编码}
-\subsection{路径与文本值的标识分配}
+下面的引理说明，两条序列保存了恢复文档所需的全部信息。
 
-定义路径映射 $\phi_p$ 与短值映射 $\phi_v$，在规定作用域内对相同字符串返回相同标识，对不同字符串分配可区分标识。路径与文本采用独立字典，便于分别解释结构条件和内容条件。订单示例可采用表~\ref{tab:xml-example-dictionary} 所示映射，具体数值按示例的首次出现次序指定。
+\begin{lemma}
+\label{lem:rep-decompose}
+对文档 $D$，由 $(R_D,T_D)$ 可以唯一确定一个与 $D$ 等价的文档。
+\end{lemma}
+
+\begin{proof}
+对 $D$ 的子树规模做归纳。按如下过程从 $T_D$ 的当前位置重建一棵子树：读取当前项 $(p,c)$，以 $p$ 的最后一个标签作为元素名创建节点；若 $c=0$，该节点为叶元素，取 $R_D$ 的下一项作为其文本；若 $c>0$，则依次重建 $c$ 棵子树作为其子节点，并按读取顺序排列。
+
+若 $D$ 只有一个元素，$T_D$ 只有一项 $(p,0)$，$R_D$ 只有一项，结论成立。设对规模较小的子树结论成立。根 $r$ 的项为 $T_D$ 的第一项 $(\mathrm{path}(r),c(r))$；前序序列中，紧随其后的是第一个子元素的子树对应的连续片段，接着是第二个子树的片段，依此类推。由归纳假设，每个片段恰好被完整读取并重建为与对应子树等价的树；叶元素在前序中的相对次序与文档顺序一致，因此每个叶元素取得的 $R_D$ 项正是其原有文本。子树按读取顺序排列，保持了兄弟顺序。故重建结果与 $D$ 满足定义~\ref{def:rep-equivalence} 的全部条件。
+\end{proof}
+
+引理~\ref{lem:rep-decompose} 不依赖路径本身的唯一性。路径只用来提供元素名，节点之间的对应关系由前序位置和子节点数确定，因此相同路径的重复容器不会混淆。第~\ref{sec:rep-decode} 节的解码算法即为上述重建过程。
+
+\section{字典标识编码}
+\label{sec:rep-dictionary}
+
+两条序列中的路径和文本仍是字符串。本节通过共享字典把它们换成整数标识，再用变长整数编码确定标识的字节表示。
+
+\textbf{路径和短文本的字典映射。} 设路径映射为 $\phi_p:\Sigma^{*}\to\mathbb{N}^{+}$，短值映射为 $\phi_v:\Sigma^{*}\to\mathbb{N}^{+}$，分别由路径字典 $\Delta_p$ 和值字典 $\Delta_v$ 维护。两个映射都是单射：相同字符串对应相同标识，不同字符串对应不同标识。编码时，若字符串已在字典中则直接返回其标识，否则分配下一个未使用的标识并追加到字典。路径和文本使用两个独立字典，使路径条件和内容条件可以分别转换。$D_1$ 按首次出现顺序得到表~\ref{tab:xml-example-dictionary} 所示映射。
+
 \begin{table}[htbp]
 \centering\small
-\caption{示例路径与文本值的字典映射}
+\caption{订单文档 $D_1$ 的路径字典和值字典}
 \label{tab:xml-example-dictionary}
 \begin{tabular}{clll}
 \toprule
@@ -202,111 +353,111 @@ T_D=\langle(p^{s}_1,c_1),\ldots,(p^{s}_M,c_M)\rangle,
 \bottomrule
 \end{tabular}
 \end{table}
-路径 ID 6 在两个商品名称记录中重复使用，路径 ID 7 在两个数量记录中重复使用；结构流中的两个商品容器共同使用路径 ID 5。文本字典以完整叶值为单位建立映射。若后续文档出现相同文本，则可以引用同一值 ID。
 
-\subsection{内容与结构记录的紧凑编码}
+字典由全部文档共享。继续编码图~\ref{fig:rep-redundancy} 中的 $D_2$ 时，其 7 条路径都已在 $\Delta_p$ 中，“鼠标”和“1”也已在 $\Delta_v$ 中，只有“1002”和“李四”需要追加为值 ID 7 和 8。$D_2$ 的编码对象因而不包含任何路径字符串，也不重复保存“鼠标”和“1”。对表~\ref{tab:rep-dataset-count} 的业务数据，全部路径只需在字典中保存 313 次，而不是在每份文档中重复书写。
 
-完成字典映射后，内容序列转为整数对序列
+\textbf{整数对序列。} 完成映射后，内容序列和结构序列分别变为
 \[
-E_D=\langle(3,1),(4,2),(6,3),(7,4),(6,5),(7,6)\rangle.
+E_D=\langle(\phi_p(p_i),\phi_v(t_i))\rangle_{i=1}^{N},\qquad
+S_D=\langle(\phi_p(p^{s}_j),c_j)\rangle_{j=1}^{M}.
 \]
-结构序列转为
+对 $D_1$ 有
+\[
+E_{D_1}=\langle(3,1),(4,2),(6,3),(7,4),(6,5),(7,6)\rangle,
+\]
 \[
 \begin{aligned}
-S_D=\langle &(1,1),(2,4),(3,0),(4,0),(5,2),\\
+S_{D_1}=\langle &(1,1),(2,4),(3,0),(4,0),(5,2),\\
              &(6,0),(7,0),(5,2),(6,0),(7,0)\rangle.
 \end{aligned}
 \]
-路径字符串被整数引用替代后，采用第二章介绍的 Varint 编码进一步按数值范围控制字节长度[21]。记整数 $x$ 的编码长度为
+路径 ID 6 和 7 在 $E_{D_1}$ 中各出现两次，路径 ID 5 在 $S_{D_1}$ 中出现两次，对应图~\ref{fig:rep-redundancy} 中蓝色标出的文档内路径重复。
+
+\textbf{变长整数编码。} 标识采用第二章介绍的无符号 LEB128 式变长整数（Varint）编码\cite{williams1999compressing}。整数 $x$ 的编码长度为
 \[
-V(x)=\max\left(1,\left\lceil\frac{\log_2(x+1)}{7}\right\rceil\right).
+V(x)=\max\left(1,\left\lceil\frac{\log_2(x+1)}{7}\right\rceil\right),
 \]
-对于示例中的整数，均有 $0\leq x<128$，每个整数占 1 B。因此，内容流依次为以下 12 个十六进制字节：
-\begin{lstlisting}[caption={示例内容流的字节序列},numbers=none]
+即 $0\sim127$ 占 1 B，$128\sim16383$ 占 2 B。字典按首次出现顺序分配标识，业务数据中的路径 ID 不超过 313，至多占 2 B；值 ID 在 15 万量级，至多占 3 B。$D_1$ 的全部整数都小于 128，内容流为以下 12 B：
+\begin{lstlisting}[caption={订单文档 $D_1$ 的内容流字节},label={lst:rep-content-bytes},numbers=none]
 03 01 04 02 06 03 07 04 06 05 07 06
 \end{lstlisting}
-结构记录编码后的大小为 20 B，其前另有 4 B 节点计数。该过程中的压缩来源可以分为两层：字典映射消除字符串的重复表示，变长编码减少较小整数的固定宽度开销。前序记录仍逐节点保留结构信息，结构重复在此体现为路径标识的复用。
+结构序列编码为 20 B。与原文相比，压缩来自两个层次：字典映射把重复的字符串换成整数引用，变长编码使较小的整数只占 1 至 2 B。
 
-\subsection{长文本值的表示}
+\textbf{长文本值。} 对 $|t|\ge\tau$ 的长文本，若也放入共享字典，单个字典条目可能达到数千字节，且这类值很少重复。因此，长值不进入 $\Delta_v$，而是在文档内保存原文。其标识由 32 位哈希计算，并将最高位置 1，与短值标识区分：
+\[
+\phi_\ell(t)=h_{32}(t)\ \mathrm{OR}\ 2^{31}.
+\]
+内容流照常写入 $(\phi_p(p),\phi_\ell(t))$，长值区保存标识、原文长度和原文字节。同一文档中重复的长值只保存一份原文。若同一文档中两个不同长值的哈希标识相同，编码器在写入长值区前比较原文，发现冲突时拒绝该输入，从而保证文档内长值标识唯一。不同文档之间的哈希冲突不影响正确性，第四章在查询时用长值区的原文做最终比较。业务数据中，长值占叶文本出现次数的 0.05\%（2,368,472 次中的 1,169 次）。
 
-原型以 1024 B 的 UTF-8 字节长度为界：小于该阈值的完整叶文本进入共享短值字典，达到阈值的文本采用文档内联表示。长值标识由 32 位哈希计算，并设置最高位以区分短值标识空间。内容流引用该标识，内联区保存标识、原文字节长度及原文字节。
+\section{二进制存储格式}
+\label{sec:rep-binary}
 
-对于同一文档内重复出现的相同长值，内联区保留一份原文；对于不同长值具有相同标识的情况，当前编码器通过原文比较检测冲突并拒绝该输入。不同文档之间仍可能存在相同哈希标识，后续内容查询据内联原文进行精确确认。该组织使长值的候选定位与完整值比较形成对应关系，同时控制共享字典的单项字符串长度。
+编码对象 $B_D$ 是一个 PostgreSQL 变长值，依次由变长头、表示头、路径区、内容流、长值区（可选）、Bloom 区和结构区组成。各区段连续存放，不留空隙。
 
-\section{面向访问的二进制组织}
-\subsection{区段划分与字段定义}
+\textbf{表示头。} 表示头由 8 个 32 位字段组成，见表~\ref{tab:representation-header}。所有偏移均以表示头首字节为基点。结构区紧接 Bloom 区，其起点由 Bloom 区的偏移和长度相加得到；长值区紧接内容流，其起点在顺序解码内容流后得到。
 
-二进制对象依次包含 PostgreSQL 变长头、表示头、排序路径区、文档序内容流、可选长值内联区、Bloom 区和前序结构区。表示头由 8 个 32 位字段组成，见表~\ref{tab:representation-header}。所有区段偏移均以表示头的首字节为基点。
 \begin{table}[htbp]
 \centering\small
-\caption{表示头的字段及定位含义}
+\caption{表示头字段}
 \label{tab:representation-header}
 \begin{tabular}{p{0.33\linewidth}p{0.57\linewidth}}
 \toprule
 字段（每项 4 B） & 含义 \\
 \midrule
-\texttt{version}、\texttt{flags} & 格式标识与区段存在标志 \\
-\texttt{global\_dict\_id} & 字典作用域标记 \\
+\texttt{version}、\texttt{flags} & 格式版本号；各可选区段是否存在的标志 \\
+\texttt{global\_dict\_id} & 编码时使用的共享字典编号 \\
 \texttt{total\_size} & 包括变长头在内的对象总长度 \\
-\texttt{content\_offset} & 排序路径区起点 \\
-\texttt{path\_index\_offset} & 文档序内容流起点 \\
+\texttt{content\_offset} & 路径区起点 \\
+\texttt{path\_index\_offset} & 内容流起点 \\
 \texttt{bloom\_offset}、\texttt{bloom\_size} & Bloom 区起点及该区总长度 \\
 \bottomrule
 \end{tabular}
 \end{table}
-其中，\texttt{content\_offset} 和 \texttt{path\_index\_offset} 是原型保留的字段名，其定位含义以上表为准。结构区接在 Bloom 区之后，起点由后者的偏移与长度相加得到；内联区起点通过内容记录数量和 Varint 解码确定。该定位规则将紧凑内容流与固定宽度路径条目连接起来。
 
-\subsection{路径摘要与内容过滤信息}
+字段 \texttt{content\_offset} 和 \texttt{path\_index\_offset} 沿用原型代码中的名称，其含义以表中说明为准。
 
-设文档有 $P$ 种不同元素路径。路径区先保存路径数 $P$ 和内容记录数 $N$，再保存按路径 ID 排序的 $P$ 个条目。每个条目为两个 32 位整数，分别表示路径 ID 和该路径对应的叶内容记录数。订单示例的计数依次为 $0,0,1,1,0,2,2$。
+\textbf{路径区。} 设文档有 $P=|P(D)|$ 条不同路径。路径区先保存 $P$ 和叶记录数 $N$，再保存 $P$ 个按路径 ID 升序排列的条目，每个条目由两个 32 位整数组成：路径 ID，以及该路径在 $E_D$ 中出现的次数。内部元素的路径也登记在路径区，出现次数为 0，因此 $\operatorname{EXISTS}$ 对内部路径同样成立。$D_1$ 的 7 个条目中，出现次数依次为 $0,0,1,1,0,2,2$。条目采用固定宽度，查询时可以用二分查找在 $O(\log P)$ 时间内判断路径是否存在，不必扫描内容流。
 
-内部路径的内容记录数为 0，其存在性由条目本身表示；叶路径的计数反映对应内容记录的数量。路径区的固定宽度条目支持二分查找，具体值仍通过文档序内容流访问。由此，排序条目承担路径集合检索，内容序列承担路径与文本的关联访问。
-
-Bloom 区从内容记录中的值 ID 派生，保存位数组长度 $m$、探测次数 $k$ 及位数组。对于 $N\geq1$，原型采用
+\textbf{Bloom 区。} Bloom 区是 $E_D$ 中全部值 ID 的成员摘要，保存位数组长度 $m$、哈希次数 $k$ 和位数组本身。对 $N\ge1$，原型取
 \[
-\begin{aligned}
-m&=\operatorname{nextpow2}(\max(1024,10N)),\\
-k&=\min\left(16,\max\left(3,\left\lfloor\frac{m}{N}\ln 2\right\rfloor\right)\right).
-\end{aligned}
+m=\operatorname{nextpow2}(\max(1024,10N)),\qquad
+k=\min\left(16,\max\left(3,\left\lfloor\frac{m}{N}\ln 2\right\rfloor\right)\right),
 \]
-相同值 ID 的内容判断与摘要检查因而具有相同输入。路径区和 Bloom 区分别服务于结构条件与内容条件，两者均由编码记录直接生成。
+其中 $\operatorname{nextpow2}(x)$ 为不小于 $x$ 的最小 2 的幂。每个叶记录至少对应 10 位，按第二章的近似公式，假阳性概率低于 1\%。插入摘要的是值 ID 而非文本，因此查询时将常量转换为值 ID 后即可检查摘要，两者使用同一组输入。
 
-\subsection{逻辑长度与布局示例}
+\textbf{长度计算。} 记长值条目数为 $J$，第 $j$ 个长值原文的长度为 $\ell_j$，各区段长度见表~\ref{tab:binary-length}。
 
-记长值内联条目数为 $J$，第 $j$ 个内联原文的 UTF-8 长度为 $\ell_j$，各区段逻辑长度见表~\ref{tab:binary-length}。
 \begin{table}[htbp]
 \centering\small
-\caption{二进制对象各区段的逻辑长度}
+\caption{编码对象各区段长度}
 \label{tab:binary-layout}\label{tab:binary-length}
-\begin{tabular}{p{0.19\linewidth}p{0.40\linewidth}p{0.29\linewidth}}
+\begin{tabular}{p{0.16\linewidth}p{0.42\linewidth}p{0.30\linewidth}}
 \toprule
-区段 & 长度（B） & 字段组成 \\
+区段 & 长度（B） & 组成 \\
 \midrule
-变长头 & $4$ & PostgreSQL 对象头 \\
+变长头 & $4$ & PostgreSQL 变长值头 \\
 表示头 & $32$ & 8 个 32 位字段 \\
 路径区 & $8+8P$ & 两项计数与 $P$ 个条目 \\
-内容流 & $C=\sum_{i=1}^{N}[V(p_i)+V(t_i)]$ & 文档序路径 ID、值 ID \\
-内联区 & $I=4+\sum_{j=1}^{J}(8+\ell_j)$ & $J>0$ 时保存计数、标识、长度与原文；$J=0$ 时 $I=0$ \\
+内容流 & $C=\sum_{i=1}^{N}[V(p_i)+V(t_i)]$ & 文档顺序的路径 ID、值 ID \\
+长值区 & $I=4+\sum_{j=1}^{J}(8+\ell_j)$，$J=0$ 时 $I=0$ & 条目数、标识、长度与原文 \\
 Bloom 区 & $B=8+\lceil m/8\rceil$ & 两项参数与位数组 \\
-结构区 & $4+S$ & 节点计数与结构记录 \\
+结构区 & $4+S$ & 元素数与结构序列 \\
 \bottomrule
 \end{tabular}
 \end{table}
-其中 $p_i,t_i$ 分别表示内容记录的路径 ID 与值 ID，结构记录的编码长度为
-\[
-S=\sum_{j=1}^{M}\left[V(p^{s}_j)+V(c_j)\right].
-\]
-各区段连续组织时，对象的逻辑长度为
+
+其中 $p_i,t_i$ 分别为 $E_D$ 第 $i$ 项的路径 ID 和值 ID，结构序列的编码长度为 $S=\sum_{j=1}^{M}[V(p^{s}_j)+V(c_j)]$。编码对象的总长度为
 \begin{equation}
 L_D=4+32+(8+8P)+C+I+B+(4+S).
 \label{eq:representation-size}
 \end{equation}
-该长度对应采用 4 B 变长头的序列化对象。数据库页内布局、TOAST 压缩或外置存储产生的物理占用，在第五章按相应统计口径评价[20]。
+该长度是序列化对象的逻辑长度；对象在数据库页中的实际占用还受 TOAST 压缩和行外存储影响，第五章分别测量\cite{pg16toast}。
 
-订单示例中 $P=7$、$N=6$、$M=10$、$J=0$，因而路径区为 64 B，内容流为 12 B，结构区为 24 B；$m=1024$、$k=16$，Bloom 区为 136 B。代入式~\eqref{eq:representation-size} 得 $L_D=272$ B。表~\ref{tab:representation-offsets} 给出以对象首字节为 0 的区段范围。
+对 $D_1$，$P=7$，$N=6$，$M=10$，$J=0$，$m=1024$，$k=16$。路径区为 64 B，内容流为 12 B，Bloom 区为 136 B，结构区为 24 B，代入式~\eqref{eq:representation-size} 得 $L_{D_1}=272$ B。各区段的字节范围如表~\ref{tab:representation-offsets} 和图~\ref{fig:representation-layout} 所示。
+
 \begin{table}[htbp]
 \centering\small
-\caption{订单示例的逻辑字节布局}
+\caption{订单文档 $D_1$ 的字节布局}
 \label{tab:representation-offsets}
 \begin{tabular}{lrrl}
 \toprule
@@ -321,7 +472,7 @@ Bloom 区 & 112 & 136 & $[112,248)$ \\
 \bottomrule
 \end{tabular}
 \end{table}
-图~\ref{fig:representation-layout} 采用 16 B 一行的布局，每一小格对应 4 B，以直观显示各区段占比。上述字节数由示例标识与序列化规则推算，用于解释逻辑格式。
+
 \begin{figure}[htbp]
 \centering
 \begin{tikzpicture}[x=1cm,y=0.32cm,font=\scriptsize]
@@ -348,78 +499,110 @@ Bloom 区 & 112 & 136 & $[112,248)$ \\
 \foreach \c in {0,...,3}{\pgfmathtruncatemacro{\coloff}{4*\c}\node at (2*\c+1,0.65) {+\coloff};}
 \node[anchor=east] at (-0.15,0.65) {偏移/B};
 \end{tikzpicture}
-\caption{订单示例的区段大小与连续字节布局}
+\caption{订单文档 $D_1$ 编码对象的字节布局（每格 4 B）}
 \label{fig:representation-layout}
 \end{figure}
-该示例规模较小，Bloom 位数组的最小配置占据较大比例，说明对象固定及辅助开销需要结合内容规模分析。共享字典独立计量，示例的 272 B 也相应作为对象长度使用。
 
-\section{解码与信息恢复}
-\subsection{区段读取与标识反查}
+$D_1$ 很小，最小 1024 位的 Bloom 位数组占了一半的字节。第五章的业务文档平均有 236.8 个叶元素，此时 $m=4096$，Bloom 区约 520 B，而内容流和结构区随记录数增长，固定开销的比例相应下降。
 
-解码器读取表示头、路径区计数以及结构区节点数，确定各序列的起点与记录数量。路径 ID 经路径字典反查获得完整路径，末级标签用于创建元素；短值 ID 经文本字典反查获得原值，长值 ID 则从内联区取得原文。记录读取以声明的区段边界为约束，字典引用在规定作用域内解析。
+\textbf{编码算法。} 完整的编码过程如算法~\ref{alg:rep-encode} 所示。
 
-\subsection{结构与内容的协同恢复}
+\begin{algorithm}[htbp]
+\caption{结构感知编码}
+\label{alg:rep-encode}
+\KwIn{XML 文档 $D$；共享字典 $\Delta_p,\Delta_v$；长值阈值 $\tau$}
+\KwOut{编码对象 $B_D$；追加新条目后的 $\Delta_p,\Delta_v$}
+解析 $D$ 得到元素树，超出适用范围时报错\;
+前序遍历元素树，得到 $R_D$ 和 $T_D$\;
+$S\leftarrow\langle\rangle$；$E\leftarrow\langle\rangle$；$\mathit{cnt}\leftarrow\emptyset$；$\mathit{Inline}\leftarrow\emptyset$\;
+\ForEach{$(p,c)\in T_D$}{
+  $a\leftarrow\phi_p(p)$，未登记时追加到 $\Delta_p$\;
+  $\mathit{cnt}[a]\leftarrow0$；将 $(a,c)$ 追加到 $S$\;
+}
+$F\leftarrow$ 按 $|R_D|$ 确定 $m,k$ 的空位数组\;
+\ForEach{$(p,t)\in R_D$}{
+  $a\leftarrow\phi_p(p)$\;
+  \eIf{$|t|<\tau$}{
+    $b\leftarrow\phi_v(t)$，未登记时追加到 $\Delta_v$\;
+  }{
+    $b\leftarrow\phi_\ell(t)$\;
+    \lIf{$b\in\mathit{Inline}$ 且 $\mathit{Inline}[b]\neq t$}{报告哈希冲突并终止}
+    $\mathit{Inline}[b]\leftarrow t$\;
+  }
+  将 $(a,b)$ 追加到 $E$；$\mathit{cnt}[a]\leftarrow\mathit{cnt}[a]+1$；将 $b$ 插入 $F$\;
+}
+将 $\mathit{cnt}$ 按路径 ID 排序，得到路径区条目\;
+\Return 表示头 $\Vert$ 路径区 $\Vert$ Varint$(E)$ $\Vert$ $\mathit{Inline}$ $\Vert$ $F$ $\Vert$ Varint$(S)$\;
+\end{algorithm}
 
-恢复过程以前序结构流为主线。每读到一个结构记录，就生成相应元素；子节点数为 0 时，读取内容流中的下一条记录，核对路径后填入文本；子节点数大于 0 时，递归恢复指定数量的子树。输出文本中的特殊字符按 XML 转义规则写出。
-\begin{lstlisting}[caption={结构与内容协同恢复过程},label={lst:decode-tree},numbers=none]
-RestoreNode(S, E, Delta_p, Delta_v, Inline):
-    (pid, child_count) <- ReadNextStructure(S)
-    tag <- LastLabel(LookupValue(Delta_p, pid))
-    WriteStartTag(tag)
-    if child_count == 0:
-        (content_pid, vid) <- ReadNextContent(E)
-        Require(content_pid == pid)
-        value <- ResolveValue(Delta_v, Inline, vid)
-        WriteEscapedText(value)
-    else:
-        repeat child_count times:
-            RestoreNode(S, E, Delta_p, Delta_v, Inline)
-    WriteEndTag(tag)
-\end{lstlisting}
-对订单示例，解码器先读 $(1,1)$ 建立根节点，再读 $(2,4)$ 建立订单。处理两个叶节点后，读取第一个 $(5,2)$ 恢复第一件商品，其两条内容记录为 $(6,3)$ 和 $(7,4)$；第二个 $(5,2)$ 则读取 $(6,5)$ 和 $(7,6)$。两个商品共享路径标识，但各自的前序位置和子节点数保留了独立边界。
+第 4--6 行处理结构序列。所有元素路径都在此登记并把计数初始化为 0，因此内部路径也会进入路径区。第 8--16 行处理内容序列：短值查字典，长值计算哈希并检查文档内冲突；每处理一个叶记录，就同时追加内容流、更新路径计数、插入 Bloom 摘要。路径区和 Bloom 区都在这一次遍历中生成，不需要重新读取原文。设文档有 $M$ 个元素，字典查找采用哈希表，则算法的期望时间为 $O(M\cdot\bar\ell+P\log P)$，其中 $\bar\ell$ 为路径和文本的平均长度，$P\log P$ 来自路径区排序。
 
-\subsection{恢复正确性与异常约束}
+\section{解码恢复与正确性}
+\label{sec:rep-decode}
 
-恢复依赖三个不变量：字典映射能够反查编码时的路径与短文本；结构记录按前序保存每个元素及其子节点数；内容记录与结构中的叶节点保持相同顺序，且对应路径一致。满足这些条件时，可以按子树递归说明恢复结果。
+解码器首先读取表示头，得到路径区、内容流、Bloom 区的偏移，再由 Bloom 区的偏移和长度定位结构区；读取路径区头部的叶记录数 $N$ 和结构区头部的元素数 $M$ 后，即可确定两条序列的长度。随后按算法~\ref{alg:rep-decode} 以结构区为主线恢复元素树。
 
-对于叶节点，结构记录确定标签，下一条内容记录确定完整文本，路径一致性检查保证二者对应。对于内部节点，假设其各子树均能恢复，则按记录中的子节点数依次恢复各子树，并在最后写出父元素结束标签，即可保留子节点数量与顺序。由叶节点向上递归，得到输入元素树与恢复元素树在既定语义上的一致性。
+\begin{algorithm}[htbp]
+\caption{结构与内容协同恢复 $\textsc{Restore}$}
+\label{alg:rep-decode}
+\KwIn{结构流 $S$ 与内容流 $E$ 的读取位置；字典 $\Delta_p,\Delta_v$；长值区 $\mathit{Inline}$}
+\KwOut{以当前位置为根的子树的 XML 文本}
+从 $S$ 读取下一项 $(a,c)$\;
+$\mathit{tag}\leftarrow$ 路径 $\Delta_p^{-1}(a)$ 的最后一个标签；输出开始标签 $\mathit{tag}$\;
+\eIf{$c=0$}{
+  从 $E$ 读取下一项 $(a',b)$\;
+  \lIf{$a'\neq a$}{报告格式错误并终止}
+  \eIf{$b$ 的最高位为 0}{$t\leftarrow\Delta_v^{-1}(b)$\;}{$t\leftarrow\mathit{Inline}[b]$\;}
+  按 XML 转义规则输出 $t$\;
+}{
+  \lFor{$i\leftarrow1$ \KwTo $c$}{$\textsc{Restore}(S,E,\Delta_p,\Delta_v,\mathit{Inline})$}
+}
+输出结束标签 $\mathit{tag}$\;
+\end{algorithm}
 
-原型在解码时检查结构计数、内容计数、路径对应及记录边界，对缺失字典项、非法变长整数和异常深度返回错误。算法分析给出恢复所依赖的不变量，实验章节则通过结构差分和回归用例观察实现对这些不变量的保持情况。
+以 $D_1$ 为例，解码器读入 $(1,1)$ 创建根元素 \texttt{orders}，读入 $(2,4)$ 创建 \texttt{order} 并依次恢复其 4 棵子树。读入 $(3,0)$ 时，从内容流取得 $(3,1)$，路径一致，值 ID 1 反查得到“1001”；\texttt{customer} 的处理相同。随后读入第一个 $(5,2)$，恢复第一个 \texttt{item}，其两个叶元素分别取得内容项 $(6,3)$ 和 $(7,4)$；第二个 $(5,2)$ 取得 $(6,5)$ 和 $(7,6)$。两个 \texttt{item} 的路径 ID 相同，但各自读取的结构项和内容项不同，因此恢复出两个独立的商品节点。
+
+算法~\ref{alg:rep-decode} 第 5 行要求内容项的路径 ID 与结构项一致。这项检查使两条序列在每个叶元素处互相校验，任一序列错位都会被立即发现。
+
+\begin{theorem}[恢复正确性]
+\label{thm:rep-restore}
+设 $B_D$ 由算法~\ref{alg:rep-encode} 以字典 $\Delta$ 生成，且解码时使用的 $\Delta$ 包含编码时的全部条目、已有条目未被修改。则对 $B_D$ 执行算法~\ref{alg:rep-decode} 得到的文档 $D'$ 满足 $D'\equiv D$。
+\end{theorem}
+
+\begin{proof}
+分三步说明。第一，Varint 编码是前缀码：每个字节的最高位指明是否还有后续字节，因此结构区和内容流可以唯一切分为原来的整数序列，解码器读出的正是 $S_D$ 和 $E_D$。第二，$\phi_p$ 和 $\phi_v$ 是单射，且字典只追加不修改，故 $\Delta_p^{-1}$ 和 $\Delta_v^{-1}$ 分别把路径 ID 和短值 ID 还原为编码时的字符串；长值标识的最高位为 1，与短值标识不重叠，且算法~\ref{alg:rep-encode} 保证同一文档内每个长值标识只对应一个原文，故长值也被正确还原。由此，解码器得到的字符串序列就是 $(R_D,T_D)$。第三，算法~\ref{alg:rep-decode} 就是引理~\ref{lem:rep-decompose} 证明中的重建过程，由该引理即得 $D'\equiv D$。
+\end{proof}
+
+定理~\ref{thm:rep-restore} 说明，编码对象满足问题定义中的约束（C1），可以替代原文作为唯一的存储形式。定理的前提是字典完整，这由原型的字典管理保证：共享字典在写入事务提交前持久化，条目只追加、不修改，详见第四章。对于不满足前提的输入，例如字典条目缺失、变长整数格式非法、结构计数与内容计数不符或嵌套深度超限，解码器返回错误，而不是输出错误的文档。第五章用 10,000 份业务文档的结构差分检验了这一结论。
 
 \section{空间代价分析}
-\subsection{编码对象的空间组成}
+\label{sec:rep-space}
 
-单个对象的逻辑成本由式~\eqref{eq:representation-size} 给出。内容流长度取决于记录数及标识范围，结构流长度取决于节点数、路径标识和子节点数，路径区随不同路径数线性增长，内联区主要由长文本原文决定。采用固定 Bloom 参数策略时，位数组还随内容记录数分段增长。
+本节分析目标函数~\eqref{eq:rep-objective} 中各项如何随数据规模和重复程度变化。
 
-对包含 $d$ 份文档的集合，设共享字典占用为 $S_{\Delta}$，逻辑表示总成本为
+\textbf{集合的总成本。} 对包含 $d$ 份文档的集合，设共享字典占用 $S_{\Delta}$，则逻辑存储总量为
 \[
 S_{\mathrm{logical}}=S_{\Delta}+\sum_{i=1}^{d}L_{D_i}.
 \]
-数据库中的实际空间还包括表、TOAST 和查询索引。实验分别测量字典文件和数据库关系的大小，再按相同范围汇总，计算共享编码及辅助查询所需的总存储空间。
+由式~\eqref{eq:representation-size}，单个对象的长度由四类成分构成：内容流 $C$ 与叶记录数 $N$ 和标识宽度成正比；结构区 $S$ 与元素数 $M$ 成正比；路径区 $8+8P$ 与文档内不同路径数成正比；长值区 $I$ 主要由长文本原文决定；表示头和 Bloom 区的最小配置构成每份文档的固定开销。数据库中的实际空间还包括表页、TOAST 和查询索引，第五章分别测量字典文件、表、TOAST 和索引的大小，再把它们相加作为总空间。
 
-\subsection{重复程度与字典摊销}
-
-设同类记录重复 $r$ 次，每次原始表示平均占 $s$ B，编码后的内容、结构及按记录增长的辅助数据平均占 $e$ B；共享字典与可摊销开销记为 $H(r)$，则可写为
+\textbf{重复程度与字典摊销。} 设同类记录重复 $r$ 次，每次的原始表示平均占 $s$ B，编码后平均占 $e$ B（包括内容流、结构区及按记录增长的辅助数据），共享字典和每份文档的固定开销合计为 $H(r)$。压缩后与压缩前的大小之比为
 \[
 \rho(r)=\frac{S_{\mathrm{enc}}(r)}{S_{\mathrm{raw}}(r)}
 \approx\frac{e}{s}+\frac{H(r)}{rs}.
 \]
-此处 $\rho$ 表示压缩后与压缩前的大小比，数值越小表示节省越多。在标识宽度与每条记录的平均大小稳定的区间内，若新增数据主要由已有路径和值组成，且 $H(r)/r$ 随重复次数增加而下降，则字典与固定元数据的单位开销相应降低。若 $H(r)=o(r)$，其摊销项在规模增长时趋于 0。例如，$H$ 为常数时，有
+$\rho$ 越小表示节省越多。第一项 $e/s$ 由标识替代字符串的程度决定：标识宽度为 1--2 B，而路径和文本的原始长度为数十字节，因此 $e$ 远小于 $s$。第二项是摊销项。若新增数据主要由已有路径和值组成，字典几乎不再增长，$H(r)$ 增长慢于 $r$，即 $H(r)=o(r)$，该项随 $r$ 增大趋于 0。例如 $H$ 为常数时，
 \[
-\frac{\mathrm{d}\rho}{\mathrm{d}r}=-\frac{H}{sr^2}\leq0.
+\frac{\mathrm{d}\rho}{\mathrm{d}r}=-\frac{H}{sr^2}<0,
 \]
-这一条件刻画了结构相似和重复值增加时的摊销机制。共享字典中新增路径与值的比例、Varint 宽度跨越阈值以及长值比例变化，会相应改变 $H(r)$ 或 $e$。
+压缩比随重复次数单调改善。反之，新增数据若不断引入新的路径和值，或标识跨过 Varint 的字节边界，$H(r)$ 和 $e$ 都会增大，压缩效果相应变差。表~\ref{tab:rep-dataset-count} 的业务数据属于前一种情形：路径集合在 1,000 份文档时已经稳定为 313 条，值字典的增长也明显慢于文档数。
 
-文档密度对固定开销具有类似影响。若单文档包含更多同类记录，头部与路径集合可以被更多内容分摊；若规模增长主要来自新增文档，每份文档仍承担自身头部及最小 Bloom 配置，共享摊销主要体现在字典部分。因此，数据规模、单文档密度和结构相似性分别通过其影响的成本项作用于压缩效果。
+\textbf{文档大小的影响。} 单份文档包含的同类记录越多，表示头、路径区和 Bloom 区的最小配置就被越多的记录分摊；若数据增长主要来自新增文档，每份新文档都要付出自己的表示头和 Bloom 区等固定开销，能被分摊的只有字典部分。因此，文档较小、数量较多时，固定开销在总空间中占比较高，这也是图~\ref{fig:representation-layout} 中 $D_1$ 的 Bloom 区占一半空间的原因。
 
-\subsection{紧凑性与访问能力的权衡}
-
-结构记录用于恢复节点关系，排序路径区用于判断路径是否存在，Bloom Filter 用于排除不匹配的文档，内联原文用于精确比较长值。这些数据都会占用空间，其作用是支持文档恢复和直接查询。配置时需要考虑文档大小、重复程度及不同查询所占的比例。
-
-本文将路径和值标识作为共同基础，使上述辅助信息能够从已有编码记录派生，后续查询与索引也据此解释相同对象。因此，压缩存储和查询在编码阶段就可以共享数据，第五章将通过实验评价其空间开销和查询性能。
+\textbf{辅助区段的空间代价。} 结构区、路径区、Bloom 区和长值区都不是恢复叶文本所必需的最小信息，但各有明确的用途：结构区保证约束（C1），路径区和 Bloom 区支持约束（C2）中的路径判断和负例排除，长值区为长文本提供精确比较依据。它们的空间代价换来的是查询时不必解压和解析原文。路径区和 Bloom 区去掉后各自对查询性能的影响，由第五章的消融实验评价。
 
 \section{本章小结}
 
-本章从 XML 路径重复、值重复及结构恢复要求出发，提出面向查询的结构感知压缩表示。方法通过文档序内容记录与前序结构记录保存文本、顺序和节点边界，以共享字典标识和变长整数减少重复字符串及整数表示开销，并从编码记录派生路径辅助信息与内容摘要。
+本章从 XML 重复信息的分析出发，提出面向查询的结构感知压缩表示方法。通过示例和 10,000 份业务文档的统计，本章说明了路径重复主要发生在文档之间，而原生 XML 类型、逐值通用压缩和“原文加叶文本索引”三种方式都无法利用这种重复，并据此提出四个设计目标。随后，本章将压缩表示问题形式化为在可恢复、可直接查询和索引键完备三项约束下减小存储总量的问题。
 
-通过订单 XML 的完整编码与恢复过程，本章给出了记录、标识、字节流和区段之间的对应关系，明确了解码所依赖的一致性条件，建立了区分对象与共享字典的空间模型。所形成的路径和值标识及其语义对应关系，为下一章的文档内查询和关系级索引键抽取提供了可复用基础。
+在方法上，文档被分解为按文档顺序的内容序列和按前序的结构序列，二者共同保存恢复所需的全部信息；路径和短文本通过共享字典转为整数标识，再以变长整数编码，路径区和 Bloom 区在编码时同步生成。本章给出了编码和解码算法，证明了解码结果与原文档等价，并分析了表示的空间组成和字典摊销条件。编码阶段形成的路径标识和值标识，将在第四章直接用于查询条件转换、文档内判断和 GIN 索引键抽取。

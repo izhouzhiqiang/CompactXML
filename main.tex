@@ -4,10 +4,12 @@
 \usepackage{amsmath,amssymb,booktabs,longtable,multirow,listings,xcolor,enumitem,tikz,xurl}
 \usetikzlibrary{arrows.meta,positioning}
 \lstset{basicstyle=\ttfamily\small,breaklines=true,columns=fullflexible,frame=single}
+\counterwithin{algocf}{chapter}
+% 参考文献中的 DOI 含下划线等字符，按 URL 排版。
+\newcommand{\doi}[1]{DOI: \href{https://doi.org/#1}{\nolinkurl{#1}}}
 
 % 封面与学位信息：有“请核对/占位”的字段须在正式提交前核实。
 \Title{面向数据库 XML 类型的压缩与索引优化方法}{Compression and Indexing Optimization for XML Types in Databases}
-\Subtitle{学位论文初稿}{Thesis Draft}
 \Branch{工学}
 \Degree{Master of Electronic Information}
 \Department{软件学院}{School of Software}
@@ -27,36 +29,46 @@
 
 % 中英文摘要按“研究问题—主要工作—验证结果”组织，与正文方法及实验结论一致。
 \Abstract{%
-数据库中的 XML 数据既需要紧凑存储，也需要支持路径访问和内容检索。重复出现的标签、路径和文本值带来存储开销，查询所需的辅助信息又会增加数据体积。为在减少存储空间的同时保持高效查询能力，本文以结构感知压缩表示为基础，研究压缩编码中间数据的复用，使路径和值标识继续用于查询处理和索引构建，减少重复存储、重复解析和字符串处理。主要工作如下。
+数据库中的 XML 数据既需要紧凑存储，也需要支持路径访问和内容检索。XML 中的重复主要来自标签路径和叶文本，且路径重复集中发生在文档之间；而原生 XML 类型逐文档保存完整标签，逐值的通用压缩只能利用文档内部的重复且查询前需解压，另存叶文本建立索引又会增加存储。为此，本文以共享字典消除跨文档重复的路径和文本，并让编码阶段形成的标识直接用于查询处理和索引构建。主要工作如下。
 
-首先，提出面向查询的 XML 结构感知压缩表示方法。根据 XML 的元素层次和文本内容，分别生成文档序内容记录和前序结构记录，保存路径与叶文本的对应关系，以及节点层次和顺序。利用共享字典将重复路径和短文本值转换为整数标识，再通过变长整数进行紧凑编码，在保留文档恢复所需信息的同时，为直接查询压缩表示提供基础。
+首先，提出面向查询的 XML 结构感知压缩方法。本文将其形式化为在可恢复、可直接查询和索引键完备三项约束下减小存储总量的问题。方法将文档分解为按文档顺序的内容序列和按前序的结构序列，利用全部文档共享的字典把路径和短文本转换为整数标识，再以变长整数编码，并在编码时同步生成路径摘要和 Bloom 摘要。本文证明了解码结果与原文档在既定信息保留范围内等价。
 
-其次，提出基于压缩编码中间数据复用的查询处理方法。将查询条件转换为与文档编码一致的路径和值标识，通过标识比较完成路径存在判断和精确内容匹配，并按照文档顺序提取目标路径的首个文本值。利用编码阶段形成的路径信息和内容过滤摘要减少查询访问，对候选结果执行精确检查。在此基础上，直接从压缩表示中提取值标识作为倒排索引键，使同一份编码信息同时服务于压缩存储、文档内查询和索引检索。
+其次，提出基于编码标识复用的查询处理方法。查询条件按同一字典转换为标识，通过整数比较完成路径存在判断、完整文本精确匹配和路径首值提取，并利用路径摘要和 Bloom 摘要减少访问。GIN 索引的键直接从压缩表示的内容流读取，无需重新解析 XML 或另存叶文本；长文本以哈希为键，候选通过内联原文复核。
 
-最后，以 PostgreSQL 为验证平台实现原型，利用业务 XML 数据评价正确性、存储开销、查询性能和构建成本。在本文约定的信息保留范围内，文档恢复和查询结果与独立解析结果一致。在一万份文档的实验中，本文方法的平均列值大小较原生 XML 减少 20.17\%。在相同的完整短叶文本精确匹配任务下，与保留原始 XML、额外保存叶文本数组并建立倒排索引的方案相比，将一份共享字典全额计入后，总存储开销减少 34.38\%，索引查询延迟与对照方案接近。本文方法的数据转换入库与索引构建总耗时较高，存储和查询收益需要结合预处理成本进行评价。
-
-研究结果表明，复用压缩编码中间数据能够在节省存储空间的同时保持高效查询，为数据库 XML 类型的压缩与索引优化提供了一种可行方法。
+最后，本文在 PostgreSQL 中实现了原型，并使用实际业务 XML 数据进行了测试。结果表明，基于本文方法实现的XML类型，压缩文档的恢复结果和查询结果均与独立解析结果一致。对 1 万份文档的测试显示，本文方法每列平均占用的存储空间比原生 XML 少 20.17\%。对于相同的短文本精确匹配查询，把共享字典占用的空间也算在内后，本文方法的总存储开销比同时保存原始 XML、叶文本数组并建立倒排索引的方案少 34.38\%，查询延迟与对照方案接近。
 }{%
-XML data in databases require compact storage and efficient path and content queries. Repeated tags, paths, and values consume space, while query structures add overhead. This thesis reuses identifiers produced during structure-aware compression for query processing and index construction, reducing redundant storage, parsing, and string processing.
+XML data in databases must be compact and support path access and content retrieval. Repetition in XML comes mainly from tag paths and leaf text, and path repetition occurs largely across documents. However, the native XML type stores complete tags in every document, per-value compression exploits only repetition within a document and requires decompression before querying, and storing leaf text separately for indexing adds storage. This thesis therefore removes cross-document repetition with a shared dictionary and uses the encoding identifiers directly for querying and indexing.
 
-First, a structure-aware compression method generates document-order content records and preorder structural records, preserving path-to-text associations, node hierarchy, and ordering. Shared dictionaries map repeated paths and short text values to identifiers. Variable-length integer encoding supports compact storage, direct queries, and reconstruction.
+First, a structure-aware XML compression method is proposed, formalized as minimizing total storage subject to recoverability, direct queryability, and index-key completeness. Each document is decomposed into a document-order content sequence and a preorder structure sequence; paths and short text are mapped to integer identifiers through shared dictionaries and stored as variable-length integers, and a path summary and a Bloom summary are generated during encoding. The decoded result is proved equivalent to the original document within the specified preservation scope.
 
-Second, query conditions use the same identifiers as document encoding to check path existence, match complete text values, and retrieve the first text value at a path. Path information and content-filtering summaries reduce data access, with exact candidate verification ensuring correctness. Value identifiers extracted from compressed data also serve as inverted-index keys, linking storage, document-level queries, and indexed retrieval.
+Second, a query processing method reusing encoding identifiers is proposed. Query conditions are mapped to identifiers through the same dictionaries, so path existence, exact text matching, and first-value retrieval use integer comparison, with the path and Bloom summaries reducing access. GIN keys are read directly from the content stream without reparsing XML or storing leaf text; long text is keyed by hashes and rechecked against inline original text.
 
-Finally, a PostgreSQL prototype is evaluated using application-derived XML data. Reconstruction and query results agree with independent parsing under the specified preservation requirements. For 10,000 documents, average column-value size is 20.17\% smaller than native XML. For identical exact-match queries on complete short leaf-text values, total storage, including one full shared dictionary, is 34.38\% lower than a baseline retaining the original XML, a leaf-text array, and its inverted index, with similar indexed-query latency. Combined conversion, loading, and index-construction time is higher, requiring preprocessing costs to be considered.
-
-These results support intermediate encoding data reuse as a feasible approach to saving space while maintaining efficient XML queries.
+Finally, a prototype is implemented in PostgreSQL and tested on real application XML data. For the resulting XML type, reconstruction and query results agree with independent parsing. On 10,000 documents, the average storage per column value is 20.17\% smaller than native XML. For the same exact matching of short text, total storage including the shared dictionary is 34.38\% lower than a scheme that keeps the original XML and a leaf-text array with an inverted index, with similar query latency.
 }
-\Keyword{XML，结构感知压缩，编码中间数据复用，压缩域查询，索引优化}{XML, Structure-Aware Compression, Reuse of Intermediate Encoding Data, Querying over Compressed Data, Index Optimization}
+
+\Keyword{XML 压缩，结构感知压缩，可查询压缩，字典编码，倒排索引}{XML compression, structure-aware compression, queryable compression, dictionary encoding, inverted index}
 \Listfigtab{on}
-\Abbreviations{\centering
-\begin{tabular}{lll}
-外文缩略字母 & 外文全称 & 中文说明\\
+\Abbreviations{\centering\small\renewcommand{\arraystretch}{1.0}
+\begin{tabular}{p{0.15\linewidth}p{0.44\linewidth}p{0.33\linewidth}}
+缩略语 & 外文全称 & 中文说明\\
+CDATA & Character Data & XML 字符数据段\\
+DTD & Document Type Definition & 文档类型定义\\
+GIN & Generalized Inverted Index & 通用倒排索引\\
+JIT & Just-In-Time & 即时编译\\
+LEB128 & Little Endian Base 128 & 小端序 128 进制变长整数编码\\
+LZ77 & Lempel--Ziv 1977 & LZ77 字典式压缩算法\\
+P95 & 95th Percentile & 第 95 百分位数\\
+RFC & Request for Comments & 互联网技术规范文档\\
+SAX & Simple API for XML & XML 事件驱动解析接口\\
+SIMD & Single Instruction, Multiple Data & 单指令多数据\\
+SIT & Structure Index Tree & 结构索引树\\
+TOAST & The Oversized-Attribute Storage Technique & 超长字段存储技术\\
+Varint & Variable-Length Integer & 变长整数编码\\
+W3C & World Wide Web Consortium & 万维网联盟\\
+XBW & XML Burrows--Wheeler Transform & XML 树的 Burrows--Wheeler 变换\\
 XML & Extensible Markup Language & 可扩展标记语言\\
 XPath & XML Path Language & XML 路径语言\\
-GIN & Generalized Inverted Index & 通用倒排索引\\
-Bloom Filter & Bloom Filter & 布隆过滤器\\
-SQL & Structured Query Language & 结构化查询语言\\
+zstd & Zstandard & Zstandard 压缩算法\\
 \end{tabular}}
 
 \begin{document}
@@ -67,6 +79,6 @@ SQL & Structured Query Language & 结构化查询语言\\
 \input{tex/chap_thesis_04}
 \input{tex/chap_thesis_06}
 \input{tex/chap_thesis_conclusion}
-\input{tex/chap_thesis_references}
+\Bib{def/GBT7714-2015-NoWarning}{ref}
 % 附录/致谢/成果页待正文材料补齐后，再启用模板相应 tex 文件。
 \end{document}

@@ -204,11 +204,16 @@
 	\RequirePackage{fontspec}     % 字体设置 (!Only for XeLaTeX!)
 }{}
 
-% 根据不同编译系统选择正确的 Times New Roman字体
+% 根据不同编译系统选择正确的西文字体
 \usepackage{iftex}
 \ifPDFTeX
 \else
-\setmainfont{Times New Roman}
+% Linux 环境通常没有 Times New Roman，使用 TeX Gyre Termes 作为兼容替代。
+\IfFontExistsTF{Times New Roman}{%
+    \setmainfont{Times New Roman}%
+}{%
+    \setmainfont{TeX Gyre Termes}%
+}
 \newfontfamily\SimSunPageNum{simsun}[
 Path = ./def/ ,
 Extension = .ttc
