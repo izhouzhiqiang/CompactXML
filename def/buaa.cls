@@ -204,7 +204,7 @@
 	\RequirePackage{fontspec}     % 字体设置 (!Only for XeLaTeX!)
 }{}
 
-% 根据不同编译系统选择正确的西文字体
+% 根据不同编译系统选择正确的 Times New Roman字体
 \usepackage{iftex}
 \ifPDFTeX
 \else
